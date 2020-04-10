@@ -1,0 +1,33 @@
+image: freebsd/latest
+packages:
+  - go
+sources:
+  - https://github.com/mellium/sasl.git
+tasks:
+  - setup: |
+      go version
+      go env
+
+      go get -u golang.org/x/lint/golint
+      go get -u github.com/securego/gosec/cmd/gosec
+
+      echo 'export PATH=$(go env GOPATH)/bin:$PATH' >> ~/.buildenv
+  - fmt: |
+      cd sasl/
+      gofmt -s -l . && [ -z "$(gofmt -s -l .)" ]
+  - vet: |
+      cd sasl/
+      go vet ./...
+  - lint: |
+      cd sasl/
+      golint -set_exit_status ./...
+  - gosec: |
+      cd sasl/
+      gosec ./...
+  - validate: |
+      cd sasl/
+      go mod tidy
+      git diff --exit-code -- go.mod go.sum
+  - stable: |
+      cd sasl/
+      go test -v -cover ./...

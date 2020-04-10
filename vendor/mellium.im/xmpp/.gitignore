@@ -1,0 +1,9 @@
+.env
+*.html
+new.txt
+old.txt
+*.out
+*.svg
+*.test
+vendor/
+*.xml

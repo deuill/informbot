@@ -1,0 +1,7 @@
+*.sw[op]
+*.svg
+*.xml
+*.out
+xmlstream.test
+vendor/
+Gopkg.lock
