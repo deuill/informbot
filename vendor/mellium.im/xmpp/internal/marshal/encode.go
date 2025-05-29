@@ -13,7 +13,48 @@ import (
 	"mellium.im/xmlstream"
 )
 
-// BUG(ssw): Functions in this package are extremely inefficient.
+// BUG(ssw): This package is very inefficient, see https://mellium.im/issue/38.
+
+// TokenReader returns a reader for the XML encoding of v.
+func TokenReader(v interface{}) (xml.TokenReader, error) {
+	// If the payload is itself a marshaler, let it create its own token reader.
+	if m, ok := v.(xmlstream.Marshaler); ok {
+		return m.TokenReader(), nil
+	}
+	// If the payload to marshal is already a TokenReader, just return it.
+	if r, ok := v.(xml.TokenReader); ok {
+		return r, nil
+	}
+
+	return tokenDecoder(v)
+}
+
+func tokenDecoder(v interface{}) (*xml.Decoder, error) {
+	// If the payload is itself a marshaler, let it create its own token reader.
+	if m, ok := v.(xmlstream.Marshaler); ok {
+		return xml.NewTokenDecoder(m.TokenReader()), nil
+	}
+	// If the payload to marshal is already a TokenReader, just return it.
+	if r, ok := v.(xml.TokenReader); ok {
+		return xml.NewTokenDecoder(r), nil
+	}
+
+	var b bytes.Buffer
+	err := xml.NewEncoder(&b).Encode(v)
+	if err != nil {
+		return nil, err
+	}
+	return xml.NewDecoder(&b), nil
+}
+
+// rawTokenReader maps a decoders RawToken method onto its Token method.
+type rawTokenReader struct {
+	*xml.Decoder
+}
+
+func (r rawTokenReader) Token() (xml.Token, error) {
+	return r.RawToken()
+}
 
 // EncodeXML writes the XML encoding of v to the stream.
 //
@@ -23,12 +64,15 @@ import (
 // If the stream is an xmlstream.Flusher, EncodeXML calls Flush before
 // returning.
 func EncodeXML(w xmlstream.TokenWriter, v interface{}) error {
-	var b bytes.Buffer
-	err := xml.NewEncoder(&b).Encode(v)
+	if wt, ok := v.(xmlstream.WriterTo); ok {
+		_, err := wt.WriteXML(w)
+		return err
+	}
+	d, err := tokenDecoder(v)
 	if err != nil {
 		return err
 	}
-	_, err = xmlstream.Copy(w, xml.NewDecoder(&b))
+	_, err = xmlstream.Copy(w, rawTokenReader{Decoder: d})
 	if err != nil {
 		return err
 	}
@@ -48,12 +92,15 @@ func EncodeXML(w xmlstream.TokenWriter, v interface{}) error {
 // If the stream is an xmlstream.Flusher, EncodeXMLElement calls Flush before
 // returning.
 func EncodeXMLElement(w xmlstream.TokenWriter, v interface{}, start xml.StartElement) error {
-	var b bytes.Buffer
-	err := xml.NewEncoder(&b).EncodeElement(v, start)
+	if wt, ok := v.(xmlstream.WriterTo); ok {
+		_, err := wt.WriteXML(w)
+		return err
+	}
+	d, err := tokenDecoder(v)
 	if err != nil {
 		return err
 	}
-	_, err = xmlstream.Copy(w, xml.NewDecoder(&b))
+	_, err = xmlstream.Copy(w, rawTokenReader{Decoder: d})
 	if err != nil {
 		return err
 	}

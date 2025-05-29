@@ -1,6 +1,6 @@
 // Copyright 2016 The Mellium Contributors.
-// Use of this source code is governed by the BSD 2-clause license that can be
-// found in the LICENSE file.
+// Use of this source code is governed by the BSD 2-clause
+// license that can be found in the LICENSE file.
 
 package sasl
 
@@ -31,6 +31,14 @@ func TLSState(cs tls.ConnectionState) Option {
 	}
 }
 
+// nonce overrides the nonce used for authentication attempts.
+// This defaults to a random value and should not be changed.
+func setNonce(v []byte) Option {
+	return func(n *Negotiator) {
+		n.nonce = v
+	}
+}
+
 // RemoteMechanisms sets a list of mechanisms supported by the remote client or
 // server with which the state machine will be negotiating.
 // It is used to determine if the server supports channel binding.
@@ -49,5 +57,13 @@ func RemoteMechanisms(m ...string) Option {
 func Credentials(f func() (Username, Password, Identity []byte)) Option {
 	return func(n *Negotiator) {
 		n.credentials = f
+	}
+}
+
+// SaltedCredentials provides the negotiator with a SaltedCredentialsFetcher
+// that used to fetch user information from storage.
+func SaltedCredentials(f SaltedCredentialsFetcher) Option {
+	return func(n *Negotiator) {
+		n.saltedCredentials = f
 	}
 }

@@ -12,60 +12,13 @@ import (
 	"fmt"
 	"io"
 
+	"mellium.im/xmlstream"
 	"mellium.im/xmpp/internal/decl"
-	"mellium.im/xmpp/internal/ns"
-	"mellium.im/xmpp/jid"
+	"mellium.im/xmpp/stanza"
 	"mellium.im/xmpp/stream"
 )
 
-// Info contains metadata extracted from a stream start token.
-type Info struct {
-	to      *jid.JID
-	from    *jid.JID
-	id      string
-	version Version
-	xmlns   string
-	lang    string
-}
-
-// This MUST only return stream errors.
-// TODO: Is the above true? Just make it return a StreamError?
-func streamFromStartElement(s xml.StartElement) (Info, error) {
-	streamData := Info{}
-	for _, attr := range s.Attr {
-		switch attr.Name {
-		case xml.Name{Space: "", Local: "to"}:
-			streamData.to = &jid.JID{}
-			if err := streamData.to.UnmarshalXMLAttr(attr); err != nil {
-				return streamData, stream.ImproperAddressing
-			}
-		case xml.Name{Space: "", Local: "from"}:
-			streamData.from = &jid.JID{}
-			if err := streamData.from.UnmarshalXMLAttr(attr); err != nil {
-				return streamData, stream.ImproperAddressing
-			}
-		case xml.Name{Space: "", Local: "id"}:
-			streamData.id = attr.Value
-		case xml.Name{Space: "", Local: "version"}:
-			err := (&streamData.version).UnmarshalXMLAttr(attr)
-			if err != nil {
-				return streamData, stream.BadFormat
-			}
-		case xml.Name{Space: "", Local: "xmlns"}:
-			if attr.Value != "jabber:client" && attr.Value != "jabber:server" {
-				return streamData, stream.InvalidNamespace
-			}
-			streamData.xmlns = attr.Value
-		case xml.Name{Space: "xmlns", Local: "stream"}:
-			if attr.Value != stream.NS {
-				return streamData, stream.InvalidNamespace
-			}
-		case xml.Name{Space: "xml", Local: "lang"}:
-			streamData.lang = attr.Value
-		}
-	}
-	return streamData, nil
-}
+const wsNamespace = "urn:ietf:params:xml:ns:xmpp-framing"
 
 // Send sends a new XML header followed by a stream start element on the given
 // io.Writer.
@@ -75,57 +28,70 @@ func streamFromStartElement(s xml.StartElement) (Info, error) {
 // is much faster than encoding.
 // Afterwards, clear the StreamRestartRequired bit and set the output stream
 // information.
-func Send(rw io.ReadWriter, s2s bool, version Version, lang string, location, origin, id string) (Info, error) {
-	streamData := Info{}
-	switch s2s {
-	case true:
-		streamData.xmlns = ns.Server
-	case false:
-		streamData.xmlns = ns.Client
-	}
-
-	streamData.id = id
-	if id == "" {
-		id = " "
-	} else {
-		id = ` id='` + id + `' `
-	}
-
+func Send(rw io.ReadWriter, streamData *stream.Info, ws bool, version stream.Version, lang, to, from, id string) error {
+	streamData.ID = id
 	b := bufio.NewWriter(rw)
-	_, err := fmt.Fprintf(b,
-		decl.XMLHeader+`<stream:stream%sto='%s' from='%s' version='%s' `,
-		id,
-		location,
-		origin,
-		version,
-	)
+	var err error
+	if ws {
+		_, err = fmt.Fprintf(b,
+			`<open xmlns="urn:ietf:params:xml:ns:xmpp-framing" version='%s'`,
+			version,
+		)
+	} else {
+		_, err = fmt.Fprintf(b,
+			decl.XMLHeader+`<stream:stream xmlns='%s' xmlns:stream='http://etherx.jabber.org/streams' version='%s'`,
+			streamData.XMLNS,
+			version,
+		)
+	}
 	if err != nil {
-		return streamData, err
+		return err
+	}
+
+	if id != "" {
+		_, err = fmt.Fprintf(b, " id='%s'", id)
+		if err != nil {
+			return err
+		}
+	}
+	if to != "" {
+		_, err = fmt.Fprintf(b, " to='%s'", to)
+		if err != nil {
+			return err
+		}
+	}
+	if from != "" {
+		_, err = fmt.Fprintf(b, " from='%s'", from)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(lang) > 0 {
-		_, err = b.Write([]byte("xml:lang='"))
+		_, err = b.Write([]byte(" xml:lang='"))
 		if err != nil {
-			return streamData, err
+			return err
 		}
 		err = xml.EscapeText(b, []byte(lang))
 		if err != nil {
-			return streamData, err
+			return err
 		}
-		_, err = b.Write([]byte("' "))
+		_, err = b.Write([]byte("'"))
 		if err != nil {
-			return streamData, err
+			return err
 		}
 	}
 
-	_, err = fmt.Fprintf(b, `xmlns='%s' xmlns:stream='http://etherx.jabber.org/streams'>`,
-		streamData.xmlns,
-	)
+	if ws {
+		_, err = fmt.Fprint(b, `/>`)
+	} else {
+		_, err = fmt.Fprint(b, `>`)
+	}
 	if err != nil {
-		return streamData, err
+		return err
 	}
 
-	return streamData, b.Flush()
+	return b.Flush()
 }
 
 // Expect reads a token from d and expects that it will be a new stream start
@@ -133,54 +99,81 @@ func Send(rw io.ReadWriter, s2s bool, version Version, lang string, location, or
 // If not, an error is returned. It then handles feature negotiation for the new
 // stream.
 // If an XML header is discovered instead, it is skipped.
-func Expect(ctx context.Context, d xml.TokenReader, recv bool) (streamData Info, err error) {
+func Expect(ctx context.Context, in *stream.Info, d xml.TokenReader, recv, ws bool) error {
 	// Skip the XML declaration (if any).
-	d = decl.Skip(d)
+	d = negotiateReader(decl.Skip(d), ws)
 
 	for {
 		select {
 		case <-ctx.Done():
-			return streamData, ctx.Err()
+			return ctx.Err()
 		default:
 		}
 		t, err := d.Token()
 		if err != nil {
-			return streamData, err
+			return err
 		}
 		switch tok := t.(type) {
+		case xml.CharData:
+			// If we get whitespace (the only valid chardata let through by the
+			// negotiateReader call above), skip it.
+			continue
 		case xml.StartElement:
 			switch {
 			case tok.Name.Local == "error" && tok.Name.Space == stream.NS:
 				se := stream.Error{}
 				if err := xml.NewTokenDecoder(d).DecodeElement(&se, &tok); err != nil {
-					return streamData, err
+					return err
 				}
-				return streamData, se
-			case tok.Name.Local != "stream":
-				return streamData, stream.BadFormat
-			case tok.Name.Space != stream.NS:
-				return streamData, stream.InvalidNamespace
+				return se
+			case !ws && (tok.Name.Local != "stream" || tok.Name.Space != stream.NS):
+				return fmt.Errorf("expected stream open element %v, got %v: %w", xml.Name{Space: stream.NS, Local: "stream"}, tok.Name, stream.InvalidNamespace)
+			case ws && (tok.Name.Local != "open" || tok.Name.Space != wsNamespace):
+				return fmt.Errorf("expected WebSocket stream open element %v, got %v: %w", xml.Name{Space: wsNamespace, Local: "open"}, tok.Name, stream.InvalidNamespace)
+			case ws && tok.Name.Local == "open" && tok.Name.Space == wsNamespace:
+				// Websocket payloads are always full XML documents, so the "open"
+				// element is closed as well.
+				err = xmlstream.Skip(d)
+				if err != nil {
+					return err
+				}
 			}
 
-			streamData, err = streamFromStartElement(tok)
+			err = in.FromStartElement(tok)
 			switch {
 			case err != nil:
-				return streamData, err
-			case streamData.version != DefaultVersion:
-				return streamData, stream.UnsupportedVersion
+				return err
+			case in.Version != stream.DefaultVersion:
+				return stream.UnsupportedVersion
 			}
 
-			if !recv && streamData.id == "" {
-				// if we are the initiating entity and there is no stream ID…
-				return streamData, stream.BadFormat
+			if !ws && in.XMLNS != stanza.NSClient && in.XMLNS != stanza.NSServer {
+				return fmt.Errorf("expected jabber:client or jabber:server for default namespace, got %q: %w", in.XMLNS, stream.InvalidNamespace)
 			}
-			return streamData, nil
-		case xml.ProcInst:
-			return streamData, stream.RestrictedXML
-		case xml.EndElement:
-			return streamData, stream.NotWellFormed
-		default:
-			return streamData, stream.RestrictedXML
+
+			if !recv && in.ID == "" {
+				// if we are the initiating entity and there is no stream ID…
+				return fmt.Errorf("initiating entity must set stream ID: %w", stream.BadFormat)
+			}
+			return nil
 		}
 	}
+}
+
+const (
+	closeStreamTag   = `</stream:stream>`
+	closeStreamWSTag = `<close xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`
+)
+
+// Close sends a stream end token.
+func Close(w io.Writer, streamData *stream.Info) error {
+	var err error
+	switch xmlns := streamData.Name.Space; xmlns {
+	case wsNamespace:
+		_, err = w.Write([]byte(closeStreamWSTag))
+	default:
+		// case stream.NS:
+		_, err = w.Write([]byte(closeStreamTag))
+	}
+	return err
 }

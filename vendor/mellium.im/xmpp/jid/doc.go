@@ -2,6 +2,8 @@
 // Use of this source code is governed by the BSD 2-clause
 // license that can be found in the LICENSE file.
 
+//go:generate go run ../internal/genfeature -vars=FeatureEscaping:`jid\20escaping`
+
 // Package jid implements the XMPP address format.
 //
 // XMPP addresses, more often called "JID's" (Jabber ID's) for historical
@@ -14,9 +16,9 @@
 // email with the resourcepart appended after a forward slash.
 // For example, the following are all valid JIDs:
 //
-//     shakespeare@example.net
-//     shakespeare@example.net/phone-b5c93ded
-//     example.net
+//	shakespeare@example.net
+//	shakespeare@example.net/phone-b5c93ded
+//	example.net
 //
 // The first represents the account "shakespeare" on the service "example.net",
 // the second represents a specific phone connected to that account, and the

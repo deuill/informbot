@@ -6,21 +6,22 @@ package xmpp
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
-	"fmt"
 	"io"
 
 	"mellium.im/sasl"
 	"mellium.im/xmlstream"
 	"mellium.im/xmpp/internal/ns"
 	"mellium.im/xmpp/internal/saslerr"
-	"mellium.im/xmpp/stream"
 )
 
-// BUG(ssw): SASL feature does not have security layer byte precision.
+var (
+	errNoMechanisms      = errors.New(`xmpp: no matching SASL mechanisms found`)
+	errUnexpectedPayload = errors.New(`xmpp: unexpected payload encountered during auth`)
+	errTerminated        = errors.New(`xmpp: the remote entity terminated authentication`)
+)
 
 // SASL returns a stream feature for performing authentication using the Simple
 // Authentication and Security Layer (SASL) as defined in RFC 4422.
@@ -33,17 +34,27 @@ import (
 // troubleshoot an issue.
 // Normally it is left blank and the localpart of the Origin JID is used.
 func SASL(identity, password string, mechanisms ...sasl.Mechanism) StreamFeature {
+	return newSASL(identity, password, nil, mechanisms...)
+}
+
+// SASLServer is like SASL but the returned feature uses the provided
+// permissions func to validate credentials provided by the client.
+func SASLServer(permissions func(*sasl.Negotiator) bool, mechanisms ...sasl.Mechanism) StreamFeature {
+	return newSASL("", "", permissions, mechanisms...)
+}
+
+func newSASL(identity, password string, permissions func(*sasl.Negotiator) bool, mechanisms ...sasl.Mechanism) StreamFeature {
 	if len(mechanisms) == 0 {
-		panic("xmpp: Must specify at least 1 SASL mechanism")
+		panic("xmpp: must specify at least one SASL mechanism")
 	}
 	return StreamFeature{
 		Name:       xml.Name{Space: ns.SASL, Local: "mechanisms"},
 		Necessary:  Secure,
 		Prohibited: Authn,
-		List: func(ctx context.Context, e xmlstream.TokenWriter, start xml.StartElement) (req bool, err error) {
-			req = true
-			if err = e.EncodeToken(start); err != nil {
-				return
+		List: func(ctx context.Context, e xmlstream.TokenWriter, start xml.StartElement) (bool, error) {
+			err := e.EncodeToken(start)
+			if err != nil {
+				return true, err
 			}
 
 			startMechanism := xml.StartElement{Name: xml.Name{Space: "", Local: "mechanism"}}
@@ -55,70 +66,170 @@ func SASL(identity, password string, mechanisms ...sasl.Mechanism) StreamFeature
 				}
 
 				if err = e.EncodeToken(startMechanism); err != nil {
-					return
+					return true, err
 				}
 				if err = e.EncodeToken(xml.CharData(m.Name)); err != nil {
-					return
+					return true, err
 				}
 				if err = e.EncodeToken(startMechanism.End()); err != nil {
-					return
+					return true, err
 				}
 			}
-			return req, e.EncodeToken(start.End())
+			return true, e.EncodeToken(start.End())
 		},
-		Parse: func(ctx context.Context, r xml.TokenReader, start *xml.StartElement) (bool, interface{}, error) {
+		Parse: func(ctx context.Context, d *xml.Decoder, start *xml.StartElement) (bool, interface{}, error) {
 			parsed := struct {
 				XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl mechanisms"`
 				List    []string `xml:"urn:ietf:params:xml:ns:xmpp-sasl mechanism"`
 			}{}
-			err := xml.NewTokenDecoder(r).DecodeElement(&parsed, start)
+			err := d.DecodeElement(&parsed, start)
 			return true, parsed.List, err
 		},
-		Negotiate: func(ctx context.Context, session *Session, data interface{}) (mask SessionState, rw io.ReadWriter, err error) {
+		Negotiate: func(ctx context.Context, session *Session, data interface{}) (SessionState, io.ReadWriter, error) {
 			if (session.State() & Received) == Received {
-				panic("SASL server not yet implemented")
+				return negotiateServer(ctx, identity, password, permissions, session, data, mechanisms...)
 			}
 
-			c := session.Conn()
+			return negotiateClient(ctx, identity, password, session, data, mechanisms...)
+		},
+	}
+}
 
-			var selected sasl.Mechanism
-			// Select a mechanism, preferring the client order.
-		selectmechanism:
+func negotiateServer(ctx context.Context, identity, password string, permissions func(*sasl.Negotiator) bool, session *Session, data interface{}, mechanisms ...sasl.Mechanism) (SessionState, io.ReadWriter, error) {
+	w := session.TokenWriter()
+	/* #nosec */
+	defer w.Close()
+	r := session.TokenReader()
+	/* #nosec */
+	defer r.Close()
+	d := xml.NewTokenDecoder(r)
+
+	var (
+		selected sasl.Mechanism
+		server   *sasl.Negotiator
+		resp     []byte
+	)
+	for more := true; more; {
+		tok, err := d.Token()
+		if err != nil {
+			return 0, nil, err
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			return 0, nil, errUnexpectedPayload
+		}
+		fail, ok, err := decodeIfSASLErr(d, start)
+		switch {
+		case err != nil:
+			return 0, nil, err
+		case ok:
+			return 0, nil, fail
+		}
+		selection := struct {
+			XMLName xml.Name
+			Name    string `xml:"mechanism,attr"`
+			Payload []byte `xml:",chardata"`
+		}{}
+		err = d.DecodeElement(&selection, &start)
+		if err != nil {
+			return 0, nil, err
+		}
+
+		switch selection.XMLName {
+		case xml.Name{Space: ns.SASL, Local: "auth"}:
+			selected = sasl.Mechanism{}
 			for _, m := range mechanisms {
-				for _, name := range data.([]string) {
-					if name == m.Name {
-						selected = m
-						break selectmechanism
-					}
+				if selection.Name == m.Name {
+					selected = m
+					break
 				}
 			}
+
 			// No matching mechanism found…
 			if selected.Name == "" {
-				return mask, nil, errors.New(`No matching SASL mechanisms found`)
+				err = sendSASLError(w, saslerr.Error{
+					Condition: saslerr.ConditionInvalidMechanism,
+				})
+				if err != nil {
+					return 0, nil, err
+				}
+				return 0, nil, errNoMechanisms
 			}
 
 			opts := []sasl.Option{
 				sasl.Credentials(func() ([]byte, []byte, []byte) {
 					return []byte(session.LocalAddr().Localpart()), []byte(password), []byte(identity)
 				}),
-				sasl.RemoteMechanisms(data.([]string)...),
 			}
 
-			if tlsConn, ok := c.(*tls.Conn); ok {
-				opts = append(opts, sasl.TLSState(tlsConn.ConnectionState()))
+			if connState := session.ConnectionState(); connState.Version != 0 {
+				opts = append(opts, sasl.TLSState(connState))
 			}
-			client := sasl.NewClient(selected, opts...)
 
-			more, resp, err := client.Step(nil)
+			server = sasl.NewServer(selected, permissions, opts...)
+		case xml.Name{Space: ns.SASL, Local: "abort"}:
+			err = sendSASLError(w, saslerr.Error{
+				Condition: saslerr.ConditionAborted,
+			})
 			if err != nil {
-				return mask, nil, err
+				return 0, nil, err
 			}
+			return 0, nil, errTerminated
+		case xml.Name{Space: ns.SASL, Local: "response"}:
+			// We never got the initial <auth/> payload and selected a mechanism. This
+			// would be bad, so error out.
+			if server == nil || selected.Name == "" {
+				err = sendSASLError(w, saslerr.Error{
+					Condition: saslerr.ConditionMalformedRequest,
+				})
+				if err != nil {
+					return 0, nil, err
+				}
+				return 0, nil, errUnexpectedPayload
+			}
+		default:
+			err = sendSASLError(w, saslerr.Error{
+				Condition: saslerr.ConditionMalformedRequest,
+			})
+			if err != nil {
+				return 0, nil, err
+			}
+			return 0, nil, errUnexpectedPayload
+		}
 
-			// RFC6120 §6.4.2:
-			//     If the initiating entity needs to send a zero-length initial
-			//     response, it MUST transmit the response as a single equals sign
-			//     character ("="), which indicates that the response is present but
-			//     contains no data.
+		// An empty payload or a payload of "=" (the correct way to transmit an empty
+		// payload) will result in a zero length buffer).
+		l := base64.StdEncoding.DecodedLen(len(selection.Payload))
+		var decodedData []byte
+		if l > 1 {
+			decodedData = make([]byte, l)
+			n, err := base64.StdEncoding.Decode(decodedData, selection.Payload)
+			if err != nil {
+				return 0, nil, err
+			}
+			decodedData = decodedData[:n]
+		}
+		more, resp, err = server.Step(decodedData)
+		switch err {
+		case nil:
+		case sasl.ErrAuthn:
+			e := sendSASLError(w, saslerr.Error{
+				Condition: saslerr.ConditionNotAuthorized,
+			})
+			if e != nil {
+				err = e
+			}
+			return 0, nil, err
+		default:
+			return 0, nil, err
+		}
+
+		// RFC6120 §6.4.2:
+		//     If the initiating entity needs to send a zero-length initial
+		//     response, it MUST transmit the response as a single equals sign
+		//     character ("="), which indicates that the response is present but
+		//     contains no data.
+		if more {
 			var encodedResp []byte
 			if len(resp) == 0 {
 				encodedResp = []byte{'='}
@@ -127,89 +238,204 @@ func SASL(identity, password string, mechanisms ...sasl.Mechanism) StreamFeature
 				base64.StdEncoding.Encode(encodedResp, resp)
 			}
 
-			// Send <auth/> and the initial payload to start SASL auth.
-			if _, err = fmt.Fprintf(c,
-				`<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='%s'>%s</auth>`,
-				selected.Name, encodedResp,
-			); err != nil {
+			_, err = xmlstream.Copy(w, xmlstream.Wrap(
+				xmlstream.Token(xml.CharData(encodedResp)),
+				xml.StartElement{
+					Name: xml.Name{Space: ns.SASL, Local: "challenge"},
+				},
+			))
+			if err != nil {
+				return 0, nil, err
+			}
+			err = w.Flush()
+			if err != nil {
+				return 0, nil, err
+			}
+		}
+	}
+
+	// If there is no more, but there was no error, auth was successful!
+	var encodedResp []byte
+	if len(resp) >= 0 {
+		encodedResp = make([]byte, base64.StdEncoding.EncodedLen(len(resp)))
+		base64.StdEncoding.Encode(encodedResp, resp)
+		_, err := xmlstream.Copy(w, xmlstream.Wrap(
+			xmlstream.Token(xml.CharData(encodedResp)),
+			xml.StartElement{
+				Name: xml.Name{Space: ns.SASL, Local: "success"},
+			},
+		))
+		if err != nil {
+			return 0, nil, err
+		}
+		return Authn, session.Conn(), nil
+	}
+
+	_, err := xmlstream.Copy(w, xmlstream.Wrap(
+		nil,
+		xml.StartElement{
+			Name: xml.Name{Space: ns.SASL, Local: "success"},
+		},
+	))
+	if err != nil {
+		return 0, nil, err
+	}
+	return Authn, session.Conn(), nil
+}
+
+func negotiateClient(ctx context.Context, identity, password string, session *Session, data interface{}, mechanisms ...sasl.Mechanism) (SessionState, io.ReadWriter, error) {
+	var mask SessionState
+	w := session.TokenWriter()
+	/* #nosec */
+	defer w.Close()
+
+	var selected sasl.Mechanism
+	// Select a mechanism, preferring the client order.
+selectmechanism:
+	for _, m := range mechanisms {
+		for _, name := range data.([]string) {
+			if name == m.Name {
+				selected = m
+				break selectmechanism
+			}
+		}
+	}
+	// No matching mechanism found…
+	if selected.Name == "" {
+		return mask, nil, errNoMechanisms
+	}
+
+	opts := []sasl.Option{
+		sasl.Credentials(func() ([]byte, []byte, []byte) {
+			return []byte(session.LocalAddr().Localpart()), []byte(password), []byte(identity)
+		}),
+		sasl.RemoteMechanisms(data.([]string)...),
+	}
+
+	if connState := session.ConnectionState(); connState.Version != 0 {
+		opts = append(opts, sasl.TLSState(connState))
+	}
+
+	client := sasl.NewClient(selected, opts...)
+	more, resp, err := client.Step(nil)
+	if err != nil {
+		return mask, nil, err
+	}
+
+	// RFC6120 §6.4.2:
+	//     If the initiating entity needs to send a zero-length initial
+	//     response, it MUST transmit the response as a single equals sign
+	//     character ("="), which indicates that the response is present but
+	//     contains no data.
+	var encodedResp []byte
+	if len(resp) == 0 {
+		encodedResp = []byte{'='}
+	} else {
+		encodedResp = make([]byte, base64.StdEncoding.EncodedLen(len(resp)))
+		base64.StdEncoding.Encode(encodedResp, resp)
+	}
+
+	// Send <auth/> and the initial payload to start SASL auth.
+	_, err = xmlstream.Copy(w, xmlstream.Wrap(
+		xmlstream.Token(xml.CharData(encodedResp)),
+		xml.StartElement{
+			Name: xml.Name{Space: ns.SASL, Local: "auth"},
+			Attr: []xml.Attr{{
+				Name:  xml.Name{Local: "mechanism"},
+				Value: selected.Name,
+			}},
+		},
+	))
+	if err != nil {
+		return mask, nil, err
+	}
+	err = w.Flush()
+	if err != nil {
+		return mask, nil, err
+	}
+
+	r := session.TokenReader()
+	defer r.Close()
+	d := xml.NewTokenDecoder(r)
+
+	// If we're already done after the first step, decode the <success/> or
+	// <failure/> before we exit.
+	if !more {
+		tok, err := d.Token()
+		if err != nil {
+			return mask, nil, err
+		}
+		if t, ok := tok.(xml.StartElement); ok {
+			// TODO: Handle the additional data that could be returned if
+			// success?
+			_, _, err := decodeSASLChallenge(d, t, false)
+			if err != nil {
 				return mask, nil, err
 			}
-
-			r := session.TokenReader()
-			defer r.Close()
-			d := xml.NewTokenDecoder(r)
-
-			// If we're already done after the first step, decode the <success/> or
-			// <failure/> before we exit.
-			if !more {
-				tok, err := d.Token()
-				if err != nil {
-					return mask, nil, err
-				}
-				if t, ok := tok.(xml.StartElement); ok {
-					// TODO: Handle the additional data that could be returned if
-					// success?
-					_, _, err := decodeSASLChallenge(d, t, false)
-					if err != nil {
-						return mask, nil, err
-					}
-				} else {
-					return mask, nil, stream.BadFormat
-				}
-			}
-
-			success := false
-			for more {
-				select {
-				case <-ctx.Done():
-					return mask, nil, ctx.Err()
-				default:
-				}
-				tok, err := d.Token()
-				if err != nil {
-					return mask, nil, err
-				}
-				var challenge []byte
-				if t, ok := tok.(xml.StartElement); ok {
-					challenge, success, err = decodeSASLChallenge(d, t, true)
-					if err != nil {
-						return mask, nil, err
-					}
-				} else {
-					return mask, nil, stream.BadFormat
-				}
-				if more, resp, err = client.Step(challenge); err != nil {
-					return mask, nil, err
-				}
-				if !more && success {
-					// We're done with SASL and we're successful
-					break
-				}
-
-				var encodedResp []byte
-				if len(resp) == 0 {
-					encodedResp = []byte{'='}
-				} else {
-					encodedResp = make([]byte, base64.StdEncoding.EncodedLen(len(resp)))
-					base64.StdEncoding.Encode(encodedResp, resp)
-				}
-
-				// TODO: What happens if there's more and success (broken server)?
-				_, err = fmt.Fprintf(c, `<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>%s</response>`, encodedResp)
-				if err != nil {
-					return mask, nil, err
-				}
-			}
-			return Authn, c, nil
-		},
+		} else {
+			return mask, nil, errUnexpectedPayload
+		}
 	}
+
+	success := false
+	for more {
+		select {
+		case <-ctx.Done():
+			return mask, nil, ctx.Err()
+		default:
+		}
+		tok, err := d.Token()
+		if err != nil {
+			return mask, nil, err
+		}
+		var challenge []byte
+		if t, ok := tok.(xml.StartElement); ok {
+			challenge, success, err = decodeSASLChallenge(d, t, true)
+			if err != nil {
+				return mask, nil, err
+			}
+		} else {
+			return mask, nil, errUnexpectedPayload
+		}
+		if more, resp, err = client.Step(challenge); err != nil {
+			return mask, nil, err
+		}
+		if !more && success {
+			// We're done with SASL and we're successful
+			break
+		}
+
+		var encodedResp []byte
+		if len(resp) == 0 {
+			encodedResp = []byte{'='}
+		} else {
+			encodedResp = make([]byte, base64.StdEncoding.EncodedLen(len(resp)))
+			base64.StdEncoding.Encode(encodedResp, resp)
+		}
+
+		// TODO: What happens if there's more and success (broken server)?
+		_, err = xmlstream.Copy(w, xmlstream.Wrap(
+			xmlstream.Token(xml.CharData(encodedResp)),
+			xml.StartElement{
+				Name: xml.Name{Space: ns.SASL, Local: "response"},
+			},
+		))
+		if err != nil {
+			return mask, nil, err
+		}
+		err = w.Flush()
+		if err != nil {
+			return mask, nil, err
+		}
+	}
+	return Authn, session.Conn(), nil
 }
 
 func decodeSASLChallenge(d *xml.Decoder, start xml.StartElement, allowChallenge bool) (challenge []byte, success bool, err error) {
 	switch start.Name {
 	case xml.Name{Space: ns.SASL, Local: "challenge"}, xml.Name{Space: ns.SASL, Local: "success"}:
 		if !allowChallenge && start.Name.Local == "challenge" {
-			return nil, false, stream.UnsupportedStanzaType
+			return nil, false, errUnexpectedPayload
 		}
 		challenge := struct {
 			Data []byte `xml:",chardata"`
@@ -227,12 +453,29 @@ func decodeSASLChallenge(d *xml.Decoder, start xml.StartElement, allowChallenge 
 
 		return decodedChallenge, start.Name.Local == "success", nil
 	case xml.Name{Space: ns.SASL, Local: "failure"}:
-		fail := saslerr.Failure{}
+		fail := saslerr.Error{}
 		if err = d.DecodeElement(&fail, &start); err != nil {
 			return nil, false, err
 		}
 		return nil, false, fail
 	default:
-		return nil, false, stream.UnsupportedStanzaType
+		return nil, false, errUnexpectedPayload
 	}
+}
+
+func sendSASLError(w xmlstream.TokenWriteFlusher, fail saslerr.Error) error {
+	_, err := xmlstream.Copy(w, fail.TokenReader())
+	if err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
+func decodeIfSASLErr(d *xml.Decoder, start xml.StartElement) (saslerr.Error, bool, error) {
+	if start.Name.Local != "failure" || start.Name.Space != ns.SASL {
+		return saslerr.Error{}, false, nil
+	}
+
+	fail := saslerr.Error{}
+	return fail, true, d.DecodeElement(&fail, &start)
 }

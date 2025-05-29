@@ -6,7 +6,9 @@ package stanza
 
 import (
 	"encoding/xml"
+	"errors"
 	"io"
+	"sort"
 
 	"mellium.im/xmlstream"
 	"mellium.im/xmpp/internal/ns"
@@ -261,13 +263,8 @@ type Error struct {
 	Text      map[string]string
 }
 
-// Error satisfies the error interface by returning the condition.
-func (se Error) Error() string {
-	return string(se.Condition)
-}
-
-// TokenReader satisfies the xmlstream.Marshaler interface for Error.
-func (se Error) TokenReader() xml.TokenReader {
+// Wrap wraps the payload in an error.
+func (se Error) Wrap(payload xml.TokenReader) xml.TokenReader {
 	start := xml.StartElement{
 		Name: xml.Name{Space: ``, Local: "error"},
 		Attr: []xml.Attr{},
@@ -280,10 +277,16 @@ func (se Error) TokenReader() xml.TokenReader {
 		start.Attr = append(start.Attr, a)
 	}
 
-	var text xml.TokenReader = xmlstream.ReaderFunc(func() (xml.Token, error) {
-		return nil, io.EOF
-	})
-	for lang, data := range se.Text {
+	// Operate in sorted order to make the output deterministic.
+	var langs []string
+	for lang := range se.Text {
+		langs = append(langs, lang)
+	}
+	sort.Strings(langs)
+
+	var text []xml.TokenReader
+	for _, lang := range langs {
+		data := se.Text[lang]
 		if data == "" {
 			continue
 		}
@@ -295,15 +298,19 @@ func (se Error) TokenReader() xml.TokenReader {
 				Value: lang,
 			}}
 		}
-		text = xmlstream.Wrap(
+		text = append(text, xmlstream.Wrap(
 			xmlstream.ReaderFunc(func() (xml.Token, error) {
 				return xml.CharData(data), io.EOF
 			}),
 			xml.StartElement{
-				Name: xml.Name{Space: ns.Stanza, Local: "text"},
+				Name: xml.Name{Space: NSError, Local: "text"},
 				Attr: attrs,
 			},
-		)
+		))
+	}
+
+	if se.Condition == "" {
+		se.Condition = UndefinedCondition
 	}
 
 	return xmlstream.Wrap(
@@ -311,13 +318,60 @@ func (se Error) TokenReader() xml.TokenReader {
 			xmlstream.Wrap(
 				nil,
 				xml.StartElement{
-					Name: xml.Name{Space: ns.Stanza, Local: string(se.Condition)},
+					Name: xml.Name{Space: NSError, Local: string(se.Condition)},
 				},
 			),
-			text,
+			xmlstream.MultiReader(text...),
+			payload,
 		),
 		start,
 	)
+}
+
+// Is will be used by errors.Is when comparing errors.
+// It compares the condition and type fields.
+// If either is empty it is treated as a wildcard.
+// If both are empty the comparison is true if target is also of type Error.
+//
+// For more information see the errors package.
+func (se Error) Is(target error) bool {
+	err, ok := target.(Error)
+	if !ok {
+		return false
+	}
+
+	switch {
+	case err.Type == "" && err.Condition == "":
+		return true
+	case err.Type == "":
+		return err.Condition == se.Condition
+	case err.Condition == "":
+		return err.Type == se.Type
+	}
+	return err.Condition == se.Condition && err.Type == se.Type
+}
+
+// Error satisfies the error interface by returning the condition.
+func (se Error) Error() string {
+	// If there is no error message, just return the condition.
+	if len(se.Text) == 0 {
+		return string(se.Condition)
+	}
+
+	// Return the default language, or a different one at random if multiple were
+	// provided.
+	var lang, txt string
+	for lang, txt = range se.Text {
+		if lang == "" {
+			break
+		}
+	}
+	return txt
+}
+
+// TokenReader satisfies the xmlstream.Marshaler interface for Error.
+func (se Error) TokenReader() xml.TokenReader {
+	return se.Wrap(nil)
 }
 
 // WriteXML satisfies the xmlstream.WriterTo interface.
@@ -338,7 +392,7 @@ func (se Error) MarshalXML(e *xml.Encoder, _ xml.StartElement) error {
 // UnmarshalXML satisfies the xml.Unmarshaler interface for StanzaError.
 func (se *Error) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	decoded := struct {
-		Condition struct {
+		Condition []struct {
 			XMLName xml.Name
 		} `xml:",any"`
 		Type ErrorType `xml:"type,attr"`
@@ -353,8 +407,11 @@ func (se *Error) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	}
 	se.Type = decoded.Type
 	se.By = decoded.By
-	if decoded.Condition.XMLName.Space == ns.Stanza {
-		se.Condition = Condition(decoded.Condition.XMLName.Local)
+	for _, cond := range decoded.Condition {
+		if cond.XMLName.Space == NSError {
+			se.Condition = Condition(cond.XMLName.Local)
+			break
+		}
 	}
 
 	for _, text := range decoded.Text {
@@ -367,4 +424,28 @@ func (se *Error) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 		se.Text[text.Lang] = text.Data
 	}
 	return nil
+}
+
+// UnmarshalError unmarshals the first stanaza error payload it finds in a token
+// stream, skipping over the sender XML if it is present.
+//
+// If no error payload is found an error indicating that the payload was not
+// found is returned.
+func UnmarshalError(r xml.TokenReader) (Error, error) {
+	iter := xmlstream.NewIter(r)
+	for iter.Next() {
+		start, p := iter.Current()
+		if start.Name.Local != "error" {
+			continue
+		}
+
+		d := xml.NewTokenDecoder(xmlstream.Wrap(p, *start))
+		var stanzaErr Error
+		decodeErr := d.Decode(&stanzaErr)
+		return stanzaErr, decodeErr
+	}
+	if err := iter.Err(); err != nil {
+		return Error{}, iter.Err()
+	}
+	return Error{}, errors.New("stanza: expected error payload")
 }

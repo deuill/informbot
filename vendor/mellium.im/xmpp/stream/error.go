@@ -10,6 +10,7 @@ import (
 	"net"
 
 	"mellium.im/xmlstream"
+	"mellium.im/xmpp/internal/ns"
 )
 
 // A list of stream errors defined in RFC 6120 §4.9.3
@@ -113,6 +114,16 @@ var (
 	// entity reference.
 	RestrictedXML = Error{Err: "restricted-xml"}
 
+	// The server will not provide service to the initiating entity but is
+	// redirecting traffic to another host under the administrative control of the
+	// same service provider.
+	// When acting as a server: Creating an error of this type can be done
+	// with the SeeOtherHostError() function.
+	// When acting as a client: This error can be returned by the stream negotiator.
+	// Handling it is up to the client implementation, an example is given in the
+	// echo example client.
+	SeeOtherHost = Error{Err: "see-other-host"}
+
 	// SystemShutdown may be sent when server is being shut down and all active
 	// streams are being closed.
 	SystemShutdown = Error{Err: "system-shutdown"}
@@ -146,45 +157,57 @@ var (
 )
 
 // SeeOtherHostError returns a new see-other-host error with the given network
-// address as the host. If the address appears to be a raw IPv6 address (eg.
-// "::1"), the error wraps it in brackets ("[::1]").
-func SeeOtherHostError(addr net.Addr, payload xml.TokenReader) Error {
-	// If the address looks like an IPv6 literal, wrap it in []
+// address as the host.
+func SeeOtherHostError(addr net.Addr) Error {
 	cdata := addr.String()
+
+	// If the address looks like a raw IPv6 literal, wrap it in []
 	if ip := net.ParseIP(cdata); ip != nil && ip.To4() == nil && ip.To16() != nil {
 		cdata = "[" + cdata + "]"
 	}
 
-	if payload != nil {
-		payload = xmlstream.MultiReader(
-			xmlstream.ReaderFunc(func() (xml.Token, error) {
-				return xml.CharData(cdata), io.EOF
-			}),
-			payload,
-		)
-	} else {
-		payload = xmlstream.ReaderFunc(func() (xml.Token, error) {
-			return xml.CharData(cdata), io.EOF
-		})
+	return Error{
+		Err:     "see-other-host",
+		Content: cdata,
 	}
-
-	return Error{Err: "see-other-host", innerXML: payload}
 }
 
-// A Error represents an unrecoverable stream-level error that may include
+// Error represents an unrecoverable stream-level error that may include
 // character data or arbitrary inner XML.
 type Error struct {
-	Err string
+	Err  string
+	Text []struct {
+		Lang  string
+		Value string
+	}
 
-	innerXML xml.TokenReader
+	// The content of the error condition element.
+	// This should only be used by see-other-host errors.
+	Content string
+
+	payload xml.TokenReader
+}
+
+// Is will be used by errors.Is when comparing errors.
+// For more information see the errors package.
+func (s Error) Is(err error) bool {
+	se, ok := err.(Error)
+	if !ok {
+		return false
+	}
+
+	if se.Err == "" {
+		return true
+	}
+	return se.Err == s.Err
 }
 
 // Error satisfies the builtin error interface and returns the name of the
 // StreamError. For instance, given the error:
 //
-//     <stream:error>
-//       <restricted-xml xmlns="urn:ietf:params:xml:ns:xmpp-streams"/>
-//     </stream:error>
+//	<stream:error>
+//	  <restricted-xml xmlns="urn:ietf:params:xml:ns:xmpp-streams"/>
+//	</stream:error>
 //
 // Error() would return "restricted-xml".
 func (s Error) Error() string {
@@ -194,20 +217,68 @@ func (s Error) Error() string {
 // UnmarshalXML satisfies the xml package's Unmarshaler interface and allows
 // StreamError's to be correctly unmarshaled from XML.
 func (s *Error) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
-	se := struct {
-		XMLName xml.Name
-		Err     struct {
-			XMLName  xml.Name
-			InnerXML []byte `xml:",innerxml"`
-		} `xml:",any"`
-	}{}
-	err := d.DecodeElement(&se, &start)
-	if err != nil {
-		return err
+	for {
+		tok, err := d.Token()
+		if err == io.EOF {
+			err = nil
+			if tok == nil {
+				return nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+
+		var start xml.StartElement
+		switch tt := tok.(type) {
+		case xml.StartElement:
+			start = tt
+		case xml.EndElement:
+			// This is the end element, everything else has been unmarshaled or skipped.
+			return nil
+		default:
+			continue
+		}
+
+		switch {
+		case start.Name.Local == "see-other-host" && start.Name.Space == NSError:
+			// Fixing https://mellium.im/issue/151 would simplify things a lot here
+			t := struct {
+				XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-streams see-other-host"`
+				Text    string   `xml:",chardata"`
+			}{}
+
+			err = d.DecodeElement(&t, &start)
+			if err != nil {
+				return err
+			}
+			s.Err = start.Name.Local
+			s.Content = t.Text
+
+		case start.Name.Local == "text" && start.Name.Space == NSError:
+			t := struct {
+				XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-streams text"`
+				Lang    string   `xml:"http://www.w3.org/XML/1998/namespace lang,attr"`
+				Text    string   `xml:",chardata"`
+			}{}
+			err = d.DecodeElement(&t, &start)
+			if err != nil {
+				return err
+			}
+			s.Text = append(s.Text, struct {
+				Lang  string
+				Value string
+			}{
+				Lang:  t.Lang,
+				Value: t.Text,
+			})
+		case start.Name.Space == NSError:
+			s.Err = start.Name.Local
+			if err = d.Skip(); err != nil {
+				return err
+			}
+		}
 	}
-	s.Err = se.Err.XMLName.Local
-	// TODO: s.InnerXML = se.Err.InnerXML
-	return nil
 }
 
 // MarshalXML satisfies the xml package's Marshaler interface and allows
@@ -220,17 +291,35 @@ func (s Error) MarshalXML(e *xml.Encoder, _ xml.StartElement) error {
 // WriteXML satisfies the xmlstream.WriterTo interface.
 // It is like MarshalXML except it writes tokens to w.
 func (s Error) WriteXML(w xmlstream.TokenWriter) (n int, err error) {
-	return xmlstream.Copy(w, s.TokenReader(nil))
+	return xmlstream.Copy(w, s.TokenReader())
 }
 
 // TokenReader returns a new xml.TokenReader that returns an encoding of
 // the error.
-func (s Error) TokenReader(payload xml.TokenReader) xml.TokenReader {
-	inner := xmlstream.Wrap(s.innerXML, xml.StartElement{Name: xml.Name{Local: s.Err, Space: ErrorNS}})
-	if payload != nil {
+func (s Error) TokenReader() xml.TokenReader {
+	inner := xmlstream.Wrap(xmlstream.ReaderFunc(func() (xml.Token, error) {
+		return xml.CharData(s.Content), io.EOF
+	}), xml.StartElement{Name: xml.Name{Local: s.Err, Space: NSError}})
+	if s.payload != nil {
 		inner = xmlstream.MultiReader(
 			inner,
-			payload,
+			s.payload,
+		)
+	}
+	for _, txt := range s.Text {
+		start := xml.StartElement{Name: xml.Name{Space: NSError, Local: "text"}}
+		if txt.Lang != "" {
+			start.Attr = append(start.Attr, xml.Attr{
+				Name:  xml.Name{Space: ns.XML, Local: "lang"},
+				Value: txt.Lang,
+			})
+		}
+		inner = xmlstream.MultiReader(
+			inner,
+			xmlstream.Wrap(
+				xmlstream.Token(xml.CharData(txt.Value)),
+				start,
+			),
 		)
 	}
 	return xmlstream.Wrap(
@@ -239,4 +328,16 @@ func (s Error) TokenReader(payload xml.TokenReader) xml.TokenReader {
 			Name: xml.Name{Local: "error", Space: NS},
 		},
 	)
+}
+
+// ApplicationError returns a copy of the Error with the provided application
+// level error included alongside the error condition.
+// Multiple, chained, calls to ApplicationError will  replace the payload each
+// time and only the final call will have any effect.
+//
+// Because the TokenReader will be consumed during marshalling errors created
+// with this method may only be marshaled once.
+func (s Error) ApplicationError(r xml.TokenReader) Error {
+	s.payload = r
+	return s
 }

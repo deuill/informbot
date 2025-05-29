@@ -8,8 +8,10 @@ package dial // import "mellium.im/xmpp/dial"
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"strconv"
+	"sync"
 
 	"mellium.im/xmpp/internal/discover"
 	"mellium.im/xmpp/jid"
@@ -37,7 +39,8 @@ func Server(ctx context.Context, network string, addr jid.JID) (net.Conn, error)
 
 // A Dialer contains options for connecting to an XMPP address.
 // After a connection is established the Dial method does not attempt to create
-// an XMPP session on the connection.
+// an XMPP session on the connection, the various session establishment
+// functions in the main xmpp package should be passed the resulting connection.
 //
 // The zero value for each field is equivalent to dialing without that option.
 // Dialing with the zero value of Dialer is equivalent to calling the Client
@@ -45,31 +48,26 @@ func Server(ctx context.Context, network string, addr jid.JID) (net.Conn, error)
 type Dialer struct {
 	net.Dialer
 
-	// NoLookup stops the dialer from looking up SRV or TXT records for the given
-	// domain. It also prevents fetching of the host metadata file.
-	// Instead, it will try to connect to the domain directly.
+	// NoLookup stops the dialer from looking up SRV records for the given domain.
+	// It also prevents fetching of the host metadata file. Instead, it will try
+	// to connect to the domain directly.
 	NoLookup bool
 
 	// S2S causes the server to attempt to dial a server-to-server connection.
 	S2S bool
 
-	// Disable TLS entirely (eg. when using StartTLS on a server that does not
-	// support implicit TLS).
+	// Disable implicit TLS entirely (eg. when using opportunistic TLS on a server
+	// that does not support implicit TLS).
 	NoTLS bool
 
-	// Attempt to create a TLS connection by first looking up SRV records (unless
-	// NoLookup is set) and then attempting to use the domains A or AAAA record.
-	// The nil value is interpreted as a tls.Config with the expected host set to
-	// that of the connection addresses domain part.
+	// The configuration to use when dialing with implicit TLS support.
+	// Setting TLSConfig has no effect if NoTLS is true.
+	// The default value is interpreted as a tls.Config with the expected host set
+	// to that of the connection addresses domain part.
 	TLSConfig *tls.Config
 }
 
 // Dial discovers and connects to the address on the named network.
-// It will attempt to look up SRV records for the JIDs domainpart or
-// connect to the domainpart directly if dialing the SRV records fails.
-// If Dial returns a net.DNSError, setting NoTLS and then NoLookup and trying
-// again may be a good fallback order.
-//
 // If the context expires before the connection is complete, an error is
 // returned. Once successfully connected, any expiration of the context will not
 // affect the connection.
@@ -78,95 +76,101 @@ type Dialer struct {
 // likely want to use one of the tcp connection types ("tcp", "tcp4", or
 // "tcp6").
 func (d *Dialer) Dial(ctx context.Context, network string, addr jid.JID) (net.Conn, error) {
-	return d.dial(ctx, network, addr)
+	return d.dial(ctx, network, addr, addr.Domainpart())
 }
 
-func getHostPort(domain, network, service string) (host string, port uint16, err error) {
-	host, strPort, splitErr := net.SplitHostPort(domain)
-	bigPort, parseErr := strconv.ParseUint(strPort, 10, 16)
-	p := uint16(bigPort)
-	if splitErr != nil || parseErr != nil {
-		// If there is no port in the domain part, pick a default port.
-		p, err = discover.LookupPort(network, service)
-	}
-	// If the error was during splitting return the domain instead of the split
-	// host.
-	if splitErr != nil {
-		return domain, p, err
-	}
-	return host, p, err
+// DialServer behaves exactly the same as Dial, besides that the server it tries
+// to connect to is given as argument instead of using the domainpart of the JID.
+//
+// Changing the server does not affect the server name expected by the default
+// TLSConfig which remains the addresses domainpart.
+func (d *Dialer) DialServer(ctx context.Context, network string, addr jid.JID, server string) (net.Conn, error) {
+	return d.dial(ctx, network, addr, server)
 }
 
-func (d *Dialer) dial(ctx context.Context, network string, addr jid.JID) (net.Conn, error) {
-	domain := addr.Domainpart()
-	service := connType(!d.NoTLS, d.S2S)
-	var addrs []*net.SRV
-	var err error
-
-	// If we're not looking up SRV records, make up some fake ones.
+func (d *Dialer) dial(ctx context.Context, network string, addr jid.JID, server string) (net.Conn, error) {
+	cfg := d.TLSConfig
+	if cfg == nil {
+		cfg = &tls.Config{
+			ServerName: addr.Domainpart(),
+			MinVersion: tls.VersionTLS12,
+		}
+		// XEP-0368
+		if d.S2S {
+			cfg.NextProtos = []string{"xmpp-server"}
+		} else {
+			cfg.NextProtos = []string{"xmpp-client"}
+		}
+	}
+	// If we're not looking up SRV records, use the A/AAAA fallback.
 	if d.NoLookup {
-		host, p, err := getHostPort(domain, network, service)
-		if err != nil {
-			return nil, err
-		}
-		addrs = append(addrs, &net.SRV{
-			Target:   host,
-			Port:     p,
-			Priority: 1,
-			Weight:   1,
-		})
-	} else {
-		addrs, err = discover.LookupService(ctx, d.Resolver, service, network, addr)
-		if err != nil && err != discover.ErrNoServiceAtAddress {
-			return nil, err
-		}
+		return d.legacy(ctx, network, server, cfg)
+	}
 
-		// If we're using TLS also try connecting on the plain records.
-		if !d.NoTLS {
-			aa, err := discover.LookupService(ctx, d.Resolver, connType(d.NoTLS, d.S2S), network, addr)
-			if err != nil && err != discover.ErrNoServiceAtAddress {
-				return nil, err
+	var xmppAddrs, xmppsAddrs []*net.SRV
+	var xmppErr, xmppsErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	if !d.NoTLS {
+		wg.Add(1)
+		go func() {
+			// Lookup xmpps-(client|server)
+			defer wg.Done()
+			xmppsService := connType(true, d.S2S)
+			addrs, e := discover.LookupServiceByDomain(ctx, d.Resolver, xmppsService, server)
+			if e != nil {
+				xmppsErr = e
+				return
 			}
-			addrs = append(addrs, aa...)
+			xmppsAddrs = addrs
+		}()
+	}
+	go func() {
+		// Lookup xmpp-(client|server)
+		defer wg.Done()
+		xmppService := connType(false, d.S2S)
+		addrs, e := discover.LookupServiceByDomain(ctx, d.Resolver, xmppService, server)
+		if e != nil {
+			xmppErr = e
+			return
 		}
+		xmppAddrs = addrs
+	}()
+	wg.Wait()
 
-		// If there aren't any records, try connecting on the main domain.
-		if len(addrs) == 0 {
-			// If there are no SRV records, use domain and default port.
-			host, p, err := getHostPort(domain, network, service)
-			if err != nil {
-				return nil, err
-			}
-
-			addrs = []*net.SRV{{
-				Target: host,
-				Port:   uint16(p),
-			}}
-		}
+	// If both lookups failed, return one of the errors.
+	if xmppsErr != nil && xmppErr != nil {
+		return nil, xmppsErr
+	}
+	addrs := make([]*net.SRV, 0, len(xmppAddrs)+len(xmppsAddrs))
+	addrs = append(addrs, xmppsAddrs...)
+	addrs = append(addrs, xmppAddrs...)
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no xmpp service found at address %s", server)
 	}
 
 	// Try dialing all of the SRV records we know about, breaking as soon as the
 	// connection is established.
-	for _, addr := range addrs {
+	var err error
+	for i, addr := range addrs {
 		var c net.Conn
 		var e error
-		if d.NoTLS {
+		// Do not dial expecting a TLS connection if we're trying addreses that we
+		// expect starttls on or if we have implicit TLS disabled.
+		if d.NoTLS || i >= len(xmppsAddrs) {
 			c, e = d.Dialer.DialContext(ctx, network, net.JoinHostPort(
 				addr.Target,
 				strconv.FormatUint(uint64(addr.Port), 10),
 			))
 		} else {
-			if d.TLSConfig == nil {
-				c, e = tls.DialWithDialer(&d.Dialer, network, net.JoinHostPort(
-					addr.Target,
-					strconv.FormatUint(uint64(addr.Port), 10),
-				), &tls.Config{ServerName: domain})
-			} else {
-				c, e = tls.DialWithDialer(&d.Dialer, network, net.JoinHostPort(
-					addr.Target,
-					strconv.FormatUint(uint64(addr.Port), 10),
-				), d.TLSConfig)
+			tlsDialer := &tls.Dialer{
+				NetDialer: &d.Dialer,
+				Config:    cfg,
 			}
+			c, e = tlsDialer.DialContext(ctx, network, net.JoinHostPort(
+				addr.Target,
+				strconv.FormatUint(uint64(addr.Port), 10),
+			))
 		}
 		if e != nil {
 			err = e
@@ -176,6 +180,22 @@ func (d *Dialer) dial(ctx context.Context, network string, addr jid.JID) (net.Co
 		return c, nil
 	}
 	return nil, err
+}
+
+func (d *Dialer) legacy(ctx context.Context, network string, domain string, cfg *tls.Config) (net.Conn, error) {
+	if !d.NoTLS {
+		tlsDialer := &tls.Dialer{
+			NetDialer: &d.Dialer,
+			Config:    cfg,
+		}
+		conn, err := tlsDialer.DialContext(ctx, network,
+			net.JoinHostPort(domain, "5223"))
+		if err == nil {
+			return conn, nil
+		}
+	}
+
+	return d.Dialer.DialContext(ctx, network, net.JoinHostPort(domain, "5222"))
 }
 
 func connType(useTLS, s2s bool) string {

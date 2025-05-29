@@ -6,88 +6,40 @@ package xmpp
 
 import (
 	"context"
+	"fmt"
 	"io"
-	"net"
 
 	"mellium.im/xmpp/internal/attr"
-	"mellium.im/xmpp/internal/stream"
+	intstream "mellium.im/xmpp/internal/stream"
+	"mellium.im/xmpp/internal/wskey"
+	"mellium.im/xmpp/jid"
+	"mellium.im/xmpp/stanza"
+	"mellium.im/xmpp/stream"
 )
 
-// Negotiator is a function that can be passed to NegotiateSession to perform
-// custom session negotiation. This can be used for creating custom stream
-// initialization logic that does not use XMPP feature negotiation such as the
-// connection mechanism described in XEP-0114: Jabber Component Protocol.
-// Normally NewClientSession or NewServerSession should be used instead.
+// Negotiator is a function that can be passed to NewSession to perform custom
+// session negotiation.
+// This can be used for creating custom stream initialization logic that does
+// not use XMPP feature negotiation such as the connection mechanism described
+// in XEP-0114: Jabber Component Protocol.
 //
-// If a Negotiator is passed into NegotiateSession it will be called repeatedly
-// until a mask is returned with the Ready bit set. Each time Negotiator is
-// called any bits set in the state mask that it returns will be set on the
-// session state and any cache value that is returned will be passed back in
-// during the next iteration. If a new io.ReadWriter is returned, it is set as
-// the session's underlying io.ReadWriter and the internal session state
-// (encoders, decoders, etc.) will be reset.
-type Negotiator func(ctx context.Context, session *Session, data interface{}) (mask SessionState, rw io.ReadWriter, cache interface{}, err error)
-
-// teeConn is a net.Conn that also copies reads and writes to the provided
-// writers.
-type teeConn struct {
-	net.Conn
-	ctx         context.Context
-	multiWriter io.Writer
-	teeReader   io.Reader
-}
-
-// newTeeConn creates a teeConn. If the provided context is canceled, writes
-// start passing through to the underlying net.Conn and are no longer copied to
-// in and out.
-func newTeeConn(ctx context.Context, c net.Conn, in, out io.Writer) teeConn {
-	if tc, ok := c.(teeConn); ok {
-		return tc
-	}
-
-	tc := teeConn{Conn: c, ctx: ctx}
-	if in != nil {
-		tc.teeReader = io.TeeReader(c, in)
-	}
-	if out != nil {
-		tc.multiWriter = io.MultiWriter(c, out)
-	}
-	return tc
-}
-
-func (tc teeConn) Write(p []byte) (int, error) {
-	if tc.multiWriter == nil {
-		return tc.Conn.Write(p)
-	}
-	select {
-	case <-tc.ctx.Done():
-		tc.multiWriter = nil
-		return tc.Conn.Write(p)
-	default:
-	}
-	return tc.multiWriter.Write(p)
-}
-
-func (tc teeConn) Read(p []byte) (int, error) {
-	if tc.teeReader == nil {
-		return tc.Conn.Read(p)
-	}
-	select {
-	case <-tc.ctx.Done():
-		tc.teeReader = nil
-		return tc.Conn.Read(p)
-	default:
-	}
-	return tc.teeReader.Read(p)
-}
+// If a Negotiator is passed into NewSession it will be called repeatedly until
+// a mask is returned with the Ready bit set.
+// When the negotiator reads the new stream start element it should unmarshal
+// the correct values into "in" and set the correct values in "out" for the
+// input and output stream respectively.
+// Each time Negotiator is called any bits set in the state mask that it returns
+// will be set on the session state, and any cache value that is returned will
+// be passed back in during the next iteration.
+// If a new io.ReadWriter is returned, it is set as the session's underlying
+// io.ReadWriter and the internal session state (encoders, decoders, etc.) will
+// be reset.
+type Negotiator func(ctx context.Context, in, out *stream.Info, session *Session, data interface{}) (mask SessionState, rw io.ReadWriter, cache interface{}, err error)
 
 // StreamConfig contains options for configuring the default Negotiator.
 type StreamConfig struct {
 	// The native language of the stream.
 	Lang string
-
-	// S2S causes the negotiator to negotiate a server-to-server (s2s) connection.
-	S2S bool
 
 	// A list of stream features to attempt to negotiate.
 	Features []StreamFeature
@@ -96,7 +48,8 @@ type StreamConfig struct {
 	// any writes to the session will be written to TeeOut (similar to the tee(1)
 	// command).
 	// This can be used to build an "XML console", but users should be careful
-	// since this bypasses TLS and could expose passwords and other sensitve data.
+	// since this bypasses TLS and could expose passwords and other sensitive
+	// data.
 	TeeIn, TeeOut io.Writer
 }
 
@@ -105,7 +58,26 @@ type StreamConfig struct {
 // session.
 // If StartTLS is one of the supported stream features, the Negotiator attempts
 // to negotiate it whether the server advertises support or not.
-func NewNegotiator(cfg StreamConfig) Negotiator {
+//
+// The cfg function will be called every time a new stream is started so that
+// the user may look up required stream features, the default language, and
+// other properties based on information about an incoming stream such as the
+// location and origin JID.
+// Individual features still control whether or not they are listed at any
+// given time, so all possible features should be returned on each step and
+// new features only added to the list when we learn that they are possible
+// eg. because the origin or location JID is set and we can look up that users
+// configuration in the database.
+// For example, you would not return StartTLS the first time this feature is
+// called then return Auth once you see that the secure bit is set on the
+// session state because the stream features themselves would handle this for
+// you.
+// Instead you would always return StartTLS and Auth, but you might only add
+// the "password reset" feature once you see that the origin JID is one that
+// has a backup email in the database.
+// The previous config is passed in at each step so that it can be re-used or
+// modified (however, this is not required).
+func NewNegotiator(cfg func(*Session, *StreamConfig) StreamConfig) Negotiator {
 	return negotiator(cfg)
 }
 
@@ -114,8 +86,9 @@ type negotiatorState struct {
 	cancelTee context.CancelFunc
 }
 
-func negotiator(cfg StreamConfig) Negotiator {
-	return func(ctx context.Context, s *Session, data interface{}) (mask SessionState, rw io.ReadWriter, restartNext interface{}, err error) {
+func negotiator(f func(*Session, *StreamConfig) StreamConfig) Negotiator {
+	cfg := f(nil, nil)
+	return func(ctx context.Context, in, out *stream.Info, s *Session, data interface{}) (mask SessionState, rw io.ReadWriter, restartNext interface{}, err error) {
 		nState, ok := data.(negotiatorState)
 		// If no state was passed in, this is the first negotiate call so make up a
 		// default.
@@ -125,6 +98,13 @@ func negotiator(cfg StreamConfig) Negotiator {
 				cancelTee: nil,
 			}
 		}
+
+		// This is a secret internal API that lets us use this same negotiator
+		// implementation in the websocket package without copy/pasting the entire
+		// implementation or creating import loops.
+		// For more information see the internal/wskey package.
+		wsCtx := ctx.Value(wskey.Key{})
+		websocket := wsCtx != nil
 
 		c := s.Conn()
 		// If the session is not already using a tee conn, but we're configured to
@@ -151,12 +131,40 @@ func negotiator(cfg StreamConfig) Negotiator {
 				// If we're the receiving entity wait for a new stream, then send one in
 				// response.
 
-				s.in.Info, err = stream.Expect(ctx, s.in.d, s.State()&Received == Received)
+				location := s.LocalAddr()
+				origin := s.RemoteAddr()
+				err = intstream.Expect(ctx, in, s.in.d, s.State()&Received == Received, websocket)
 				if err != nil {
 					nState.doRestart = false
 					return mask, nil, nState, err
 				}
-				s.out.Info, err = stream.Send(s.Conn(), cfg.S2S, stream.DefaultVersion, cfg.Lang, s.location.String(), s.origin.String(), attr.RandomID())
+
+				switch {
+				case s.state&S2S == 0 && origin.Equal(jid.JID{}):
+					// If we're a server receiving a c2s connection and "from" wasn't
+					// previously set, just set it as the new origin JID since we've probably
+					// just negotiated TLS and the client is comfortable telling us who it is
+					// claiming to be now.
+				case !origin.Equal(s.in.Info.From):
+					return mask, nil, nState, fmt.Errorf("xmpp: stream origin %s does not match previously set origin %s", s.in.Info.From, origin)
+				}
+				switch {
+				case location.Equal(jid.JID{}):
+					// If we're a server receiving connection and "to" wasn't previously set,
+					// just set it as this is the virtualhost we should use.
+				case !location.Equal(s.in.Info.To):
+					return mask, nil, nState, fmt.Errorf("xmpp: stream location %s does not match previously set location %s", s.in.Info.To, location)
+				}
+
+				location = in.To
+				origin = in.From
+
+				if s.State()&S2S == S2S {
+					out.XMLNS = stanza.NSServer
+				} else {
+					out.XMLNS = stanza.NSClient
+				}
+				err = intstream.Send(s.Conn(), out, websocket, stream.DefaultVersion, cfg.Lang, origin.String(), location.String(), attr.RandomID())
 				if err != nil {
 					nState.doRestart = false
 					return mask, nil, nState, err
@@ -164,22 +172,39 @@ func negotiator(cfg StreamConfig) Negotiator {
 			} else {
 				// If we're the initiating entity, send a new stream and then wait for
 				// one in response.
-				s.out.Info, err = stream.Send(s.Conn(), cfg.S2S, stream.DefaultVersion, cfg.Lang, s.location.String(), s.origin.String(), "")
+				origin := s.LocalAddr()
+				location := s.RemoteAddr()
+				if s.State()&S2S == S2S {
+					out.XMLNS = stanza.NSServer
+				} else {
+					out.XMLNS = stanza.NSClient
+				}
+				err = intstream.Send(s.Conn(), out, websocket, stream.DefaultVersion, cfg.Lang, location.String(), origin.String(), "")
 				if err != nil {
 					nState.doRestart = false
 					return mask, nil, nState, err
 				}
-				s.in.Info, err = stream.Expect(ctx, s.in.d, s.State()&Received == Received)
+				err = intstream.Expect(ctx, in, s.in.d, s.State()&Received == Received, websocket)
 				if err != nil {
 					nState.doRestart = false
 					return mask, nil, nState, err
+				}
+
+				switch {
+				case !location.Equal(s.in.Info.From):
+					return mask, nil, nState, fmt.Errorf("xmpp: stream location %s does not match previously set location %s", s.in.Info.From, location)
+				case !s.in.Info.To.Equal(jid.JID{}) && !origin.Equal(s.in.Info.To):
+					// Technically this logic is not correct (we should only allow empty
+					// "to" attributes if we didn't set "from" yet, so we should be
+					// checking that). However, some servers don't send a "to" at all in
+					// violation of the spec. See: https://issues.prosody.im/1625
+					return mask, nil, nState, fmt.Errorf("xmpp: stream origin %s does not match previously set origin %s", s.in.Info.To, origin)
 				}
 			}
 		}
 
-		// TODO: Check if the first token is a stream error (if so, unmarshal and
-		// return, otherwise pass the token into negotiateFeatures).
-		mask, rw, err = negotiateFeatures(ctx, s, data == nil, cfg.Features)
+		cfg = f(s, &cfg)
+		mask, rw, err = negotiateFeatures(ctx, s, data == nil, websocket, cfg.Features)
 		nState.doRestart = rw != nil
 		return mask, rw, nState, err
 	}

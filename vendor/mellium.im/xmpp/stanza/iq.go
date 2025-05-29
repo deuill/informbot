@@ -24,6 +24,25 @@ type IQ struct {
 	Type    IQType   `xml:"type,attr"`
 }
 
+// UnmarshalIQError converts the provided XML token into an IQ.
+// If the type of the IQ is "error" it unmarshals the entire payload and returns
+// the error along with the original IQ.
+func UnmarshalIQError(r xml.TokenReader, start xml.StartElement) (IQ, error) {
+	iqStart, err := NewIQ(start)
+	if err != nil {
+		return iqStart, err
+	}
+	if iqStart.Type != ErrorIQ {
+		return iqStart, nil
+	}
+
+	stanzaErr, err := UnmarshalError(r)
+	if err != nil {
+		return iqStart, err
+	}
+	return iqStart, stanzaErr
+}
+
 // NewIQ unmarshals an XML token into a IQ.
 func NewIQ(start xml.StartElement) (IQ, error) {
 	v := IQ{
@@ -43,14 +62,18 @@ func NewIQ(start xml.StartElement) (IQ, error) {
 		case "id":
 			v.ID = attr.Value
 		case "to":
-			v.To, err = jid.Parse(attr.Value)
-			if err != nil {
-				return v, err
+			if attr.Value != "" {
+				v.To, err = jid.Parse(attr.Value)
+				if err != nil {
+					return v, err
+				}
 			}
 		case "from":
-			v.From, err = jid.Parse(attr.Value)
-			if err != nil {
-				return v, err
+			if attr.Value != "" {
+				v.From, err = jid.Parse(attr.Value)
+				if err != nil {
+					return v, err
+				}
 			}
 		case "type":
 			v.Type = IQType(attr.Value)
@@ -102,6 +125,14 @@ func (iq IQ) Result(payload xml.TokenReader) xml.TokenReader {
 	iq.Type = ResultIQ
 	iq.From, iq.To = iq.To, iq.From
 	return iq.Wrap(payload)
+}
+
+// Error returns a token reader that wraps the provided Error in an IQ stanza
+// with the to and from attributes switched and the type set to ErrorIQ.
+func (iq IQ) Error(err Error) xml.TokenReader {
+	iq.Type = ErrorIQ
+	iq.From, iq.To = iq.To, iq.From
+	return iq.Wrap(err.TokenReader())
 }
 
 // IQType is the type of an IQ stanza.

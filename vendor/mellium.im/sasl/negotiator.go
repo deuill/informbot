@@ -1,12 +1,13 @@
 // Copyright 2016 The Mellium Contributors.
-// Use of this source code is governed by the BSD 2-clause license that can be
-// found in the LICENSE file.
+// Use of this source code is governed by the BSD 2-clause
+// license that can be found in the LICENSE file.
 
 package sasl
 
 import (
 	"crypto/rand"
 	"crypto/tls"
+	"fmt"
 	"strings"
 )
 
@@ -44,15 +45,17 @@ const (
 func NewClient(m Mechanism, opts ...Option) *Negotiator {
 	machine := &Negotiator{
 		mechanism: m,
-		nonce:     nonce(noncerandlen, rand.Reader),
 	}
 	getOpts(machine, opts...)
 	for _, rname := range machine.remoteMechanisms {
 		lname := m.Name
 		if lname == rname && strings.HasSuffix(lname, "-PLUS") {
 			machine.state |= RemoteCB
-			return machine
+			break
 		}
+	}
+	if len(machine.nonce) == 0 {
+		machine.nonce = nonce(noncerandlen, rand.Reader)
 	}
 	return machine
 }
@@ -64,7 +67,6 @@ func NewClient(m Mechanism, opts ...Option) *Negotiator {
 func NewServer(m Mechanism, permissions func(*Negotiator) bool, opts ...Option) *Negotiator {
 	machine := &Negotiator{
 		mechanism: m,
-		nonce:     nonce(noncerandlen, rand.Reader),
 		state:     AuthTextSent | Receiving,
 	}
 	getOpts(machine, opts...)
@@ -75,24 +77,37 @@ func NewServer(m Mechanism, permissions func(*Negotiator) bool, opts ...Option) 
 		lname := m.Name
 		if lname == rname && strings.HasSuffix(lname, "-PLUS") {
 			machine.state |= RemoteCB
-			return machine
+			break
 		}
+	}
+	if len(machine.nonce) == 0 {
+		machine.nonce = nonce(noncerandlen, rand.Reader)
 	}
 	return machine
 }
+
+// SaltedCredentialsFetcher defines function that fetches user information using
+// Username and optional Identity from storage.
+//
+// Function should return saltedPassword as well as salt and iterations used
+// to generate saltedPassword for specified SCRAM MechanismName. If there is no
+// such Username or Username is not authorized to take Identity function should
+// return ErrAuthn as an error.
+type SaltedCredentialsFetcher func(Username, Identity []byte, MechanismName string) (salt []byte, saltedPassword []byte, iterations int64, err error)
 
 // A Negotiator represents a SASL client or server state machine that can
 // attempt to negotiate auth. Negotiators should not be used from multiple
 // goroutines, and must be reset between negotiation attempts.
 type Negotiator struct {
-	tlsState         *tls.ConnectionState
-	remoteMechanisms []string
-	credentials      func() (Username, Password, Identity []byte)
-	permissions      func(*Negotiator) bool
-	mechanism        Mechanism
-	state            State
-	nonce            []byte
-	cache            interface{}
+	tlsState          *tls.ConnectionState
+	remoteMechanisms  []string
+	credentials       func() (Username, Password, Identity []byte) // client only
+	saltedCredentials SaltedCredentialsFetcher                     // server only
+	permissions       func(*Negotiator) bool
+	mechanism         Mechanism
+	state             State
+	nonce             []byte
+	cache             interface{}
 }
 
 // Nonce returns a unique nonce that is reset for each negotiation attempt. It
@@ -155,12 +170,23 @@ func (c *Negotiator) Reset() {
 }
 
 // Credentials returns a username, and password for authentication and optional
-// identity for authorization.
+// identity for authorization. Used in client negotiator.
 func (c *Negotiator) Credentials() (username, password, identity []byte) {
 	if c.credentials != nil {
 		return c.credentials()
 	}
 	return
+}
+
+// SaltedCredentials returns a salt, saltedPassword and iteration count for a
+// given username and optional identity for client authorization. Refer to
+// SaltedCredentialsFetcher documentation for details.
+// Used in server negotiator.
+func (c *Negotiator) SaltedCredentials(username, identity []byte) (salt []byte, saltedPassword []byte, iterations int64, err error) {
+	if c.saltedCredentials != nil {
+		return c.saltedCredentials(username, identity, c.mechanism.Name)
+	}
+	return nil, nil, 0, fmt.Errorf("sasl: salted credentials not provided")
 }
 
 // Permissions is the callback used by the server to authenticate the user.

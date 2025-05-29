@@ -10,7 +10,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/pkg/errors"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -139,7 +138,7 @@ func cliContext() context.Context {
 }
 
 func newLogger(modules []Module) *zap.Logger {
-	var conf Config
+	conf := Config{logLevel: zap.InfoLevel}
 	for _, mod := range modules {
 		if x, ok := mod.(loggerModule); ok {
 			_ = x(&conf)
@@ -151,7 +150,7 @@ func newLogger(modules []Module) *zap.Logger {
 	}
 
 	cfg := zap.Config{
-		Level:       zap.NewAtomicLevelAt(zap.DebugLevel),
+		Level:       zap.NewAtomicLevelAt(conf.logLevel),
 		Development: false,
 		Encoding:    "console",
 		EncoderConfig: zapcore.EncoderConfig{
@@ -183,12 +182,12 @@ func newLogger(modules []Module) *zap.Logger {
 // handlers it will be returned immediately.
 func (b *Bot) Run() error {
 	if b.initErr != nil {
-		return errors.Wrap(b.initErr, "failed to initialize bot")
+		return fmt.Errorf("failed to initialize bot: %w", b.initErr)
 	}
 
 	if len(b.Brain.registrationErrs) > 0 {
 		errs := multierr.Combine(b.Brain.registrationErrs...)
-		return errors.Wrap(errs, "invalid event handlers")
+		return fmt.Errorf("invalid event handlers: %w", errs)
 	}
 
 	b.Adapter.RegisterAt(b.Brain)
@@ -263,7 +262,7 @@ func (b *Bot) RespondRegex(expr string, fun func(Message) error) {
 	regex, err := regexp.Compile(expr)
 	if err != nil {
 		caller := firstExternalCaller()
-		err = errors.Wrap(err, caller)
+		err = fmt.Errorf("%s: %w", caller, err)
 		b.Brain.registrationErrs = append(b.Brain.registrationErrs, err)
 		return
 	}

@@ -1,15 +1,30 @@
 # XMPP
 
 [![GoDoc](https://godoc.org/mellium.im/xmpp?status.svg)][docs]
-[![Chat](https://inverse.chat/badge.svg?room=mellium@conference.samwhited.com)](https://conversations.im/j/mellium@conference.samwhited.com)
+[![Chat](https://img.shields.io/badge/XMPP-users@mellium.chat-orange.svg)](https://mellium.chat)
 [![License](https://img.shields.io/badge/license-FreeBSD-blue.svg)](https://opensource.org/licenses/BSD-2-Clause)
-[![Build Status](https://builds.sr.ht/~samwhited/xmpp.svg)](https://builds.sr.ht/~samwhited/xmpp?)
+[![Build Status](https://ci.codeberg.org/api/badges/mellium/xmpp/status.svg)](https://ci.codeberg.org/mellium/xmpp)
+[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/6086/badge)](https://bestpractices.coreinfrastructure.org/projects/6086)
 
-[![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/purple_img.png)](https://www.buymeacoffee.com/samwhited)
-[![Support Me](https://liberapay.com/assets/widgets/donate.svg)](https://liberapay.com/SamWhited/donate)
+<a href="https://opencollective.com/mellium" alt="Donate on Open Collective"><img src="https://opencollective.com/mellium/donate/button@2x.png?color=blue" width="200"/></a>
 
 
-An XMPP library in Go.
+An Extensible Messaging and Presence Protocol (XMPP) library in Go.
+XMPP (sometimes known as "Jabber") is a protocol for near-real-time data
+transmission, most commonly used for instant messaging, video chat signaling,
+and related functionality.
+This library aims to provide general protocol support with additional packages
+that focus on modern instant messaging use cases.
+
+This library supports instant messaging features such as:
+
+- Individual and group chat,
+- Blocking and unblocking users,
+- Forms and commands (eg. for controlling bots and gateways),
+- Retrieving message history,
+- General publish-subscribe semantics for storing state and data,
+- Parsing simple text styling (eg. bold, italic, quotes, etc.),
+- and more!
 
 To use it in your project, import it (or any of its other packages) like so:
 
@@ -37,6 +52,6 @@ conditions.
 
 
 [docs]: https://pkg.go.dev/mellium.im/xmpp
-[CONTRIBUTING.md]: ./docs/CONTRIBUTING.md
-[LICENSE]: ./LICENSE
-[LICENSE-GO]: ./LICENSE-GO
+[CONTRIBUTING.md]: https://mellium.im/docs/CONTRIBUTING
+[LICENSE]: https://codeberg.org/mellium/xmpp/src/branch/main/LICENSE
+[LICENSE-GO]: https://codeberg.org/mellium/xmpp/src/branch/main/LICENSE-GO

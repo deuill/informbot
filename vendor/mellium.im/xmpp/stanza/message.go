@@ -25,10 +25,31 @@ type Message struct {
 	Type    MessageType `xml:"type,attr,omitempty"`
 }
 
+// UnmarshalXMLAttr converts the provided XML attribute to a valid message type.
+// Falls back to normal message type, if an unknown, or empty value is passed.
+func (t *MessageType) UnmarshalXMLAttr(attr xml.Attr) error {
+	switch attr.Value {
+	case "normal":
+		*t = NormalMessage
+	case "chat":
+		*t = ChatMessage
+	case "error":
+		*t = ErrorMessage
+	case "groupchat":
+		*t = GroupChatMessage
+	case "headline":
+		*t = HeadlineMessage
+	default:
+		*t = NormalMessage
+	}
+	return nil
+}
+
 // NewMessage unmarshals an XML token into a Message.
 func NewMessage(start xml.StartElement) (Message, error) {
 	v := Message{
 		XMLName: start.Name,
+		Type:    "normal",
 	}
 	for _, attr := range start.Attr {
 		if attr.Name.Local == "lang" && attr.Name.Space == ns.XML {
@@ -44,17 +65,24 @@ func NewMessage(start xml.StartElement) (Message, error) {
 		case "id":
 			v.ID = attr.Value
 		case "to":
-			v.To, err = jid.Parse(attr.Value)
-			if err != nil {
-				return v, err
+			if attr.Value != "" {
+				v.To, err = jid.Parse(attr.Value)
+				if err != nil {
+					return v, err
+				}
 			}
 		case "from":
-			v.From, err = jid.Parse(attr.Value)
+			if attr.Value != "" {
+				v.From, err = jid.Parse(attr.Value)
+				if err != nil {
+					return v, err
+				}
+			}
+		case "type":
+			err = (&v.Type).UnmarshalXMLAttr(attr)
 			if err != nil {
 				return v, err
 			}
-		case "type":
-			v.Type = MessageType(attr.Value)
 		}
 	}
 	return v, nil
@@ -69,14 +97,14 @@ func (msg Message) StartElement() xml.StartElement {
 
 	attr := make([]xml.Attr, 0, 5)
 	attr = append(attr, xml.Attr{Name: xml.Name{Local: "type"}, Value: string(msg.Type)})
-	if msg.ID != "" {
-		attr = append(attr, xml.Attr{Name: xml.Name{Local: "id"}, Value: msg.ID})
-	}
 	if !msg.To.Equal(jid.JID{}) {
 		attr = append(attr, xml.Attr{Name: xml.Name{Local: "to"}, Value: msg.To.String()})
 	}
 	if !msg.From.Equal(jid.JID{}) {
 		attr = append(attr, xml.Attr{Name: xml.Name{Local: "from"}, Value: msg.From.String()})
+	}
+	if msg.ID != "" {
+		attr = append(attr, xml.Attr{Name: xml.Name{Local: "id"}, Value: msg.ID})
 	}
 	if msg.Lang != "" {
 		attr = append(attr, xml.Attr{Name: xml.Name{Space: ns.XML, Local: "lang"}, Value: msg.Lang})
@@ -91,6 +119,15 @@ func (msg Message) StartElement() xml.StartElement {
 // Wrap wraps the payload in a stanza.
 func (msg Message) Wrap(payload xml.TokenReader) xml.TokenReader {
 	return xmlstream.Wrap(payload, msg.StartElement())
+}
+
+// Error returns a token reader that wraps the provided Error in a message
+// stanza with the to and from attributes switched and the type set to
+// ErrorMessage.
+func (msg Message) Error(err Error) xml.TokenReader {
+	msg.Type = ErrorMessage
+	msg.From, msg.To = msg.To, msg.From
+	return msg.Wrap(err.TokenReader())
 }
 
 // MessageType is the type of a message stanza.
@@ -132,3 +169,17 @@ const (
 	// to reply).
 	HeadlineMessage MessageType = "headline"
 )
+
+// MarshalText ensures that the default value for MessageType is marshaled to XML as a
+// valid normal Message type, as per RFC 6121 § 5.2.2
+// It satisfies the encoding.TextMarshaler interface for MessageType.
+func (t MessageType) MarshalText() ([]byte, error) {
+	if t != NormalMessage &&
+		t != ChatMessage &&
+		t != ErrorMessage &&
+		t != GroupChatMessage &&
+		t != HeadlineMessage {
+		t = NormalMessage
+	}
+	return []byte(t), nil
+}

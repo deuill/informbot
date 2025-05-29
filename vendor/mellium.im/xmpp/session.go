@@ -2,10 +2,11 @@
 // Use of this source code is governed by the BSD 2-clause
 // license that can be found in the LICENSE file.
 
+//go:generate go run -tags=tools golang.org/x/tools/cmd/stringer -type=SessionState
+
 package xmpp
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/xml"
@@ -20,8 +21,8 @@ import (
 	"mellium.im/xmpp/dial"
 	"mellium.im/xmpp/internal/attr"
 	"mellium.im/xmpp/internal/marshal"
-	"mellium.im/xmpp/internal/ns"
 	intstream "mellium.im/xmpp/internal/stream"
+	"mellium.im/xmpp/internal/wskey"
 	"mellium.im/xmpp/jid"
 	"mellium.im/xmpp/stanza"
 	"mellium.im/xmpp/stream"
@@ -35,7 +36,59 @@ var (
 
 var errNotStart = errors.New("xmpp: SendElement did not begin with a StartElement")
 
-const closeStreamTag string = `</stream:stream>`
+// earlyCloser is a token reader that closes itself as soon as reading is
+// complete (io.EOF is reached). It is used to release the read lock as aquired
+// before starting a handler as soon as the handler finishes reading the element
+// it is given (if it doesn't read the entire element the lock will be released
+// after the handler returns).
+type earlyCloser struct {
+	r xml.TokenReader
+	c io.Closer
+}
+
+func (ec earlyCloser) Token() (xml.Token, error) {
+	tok, err := ec.r.Token()
+	if err == io.EOF {
+		e := ec.c.Close()
+		if e != nil {
+			err = e
+		}
+	}
+	return tok, err
+}
+
+// deferWriter is a token writer that only takes out a lock on the session
+// writer if EncodeToken is actually called. It is passed into handlers to defer
+// taking out the lock as late as possible (or not at all if the handler only
+// ever reads from the stream).
+type deferWriter struct {
+	s *Session
+	w xmlstream.TokenWriteFlushCloser
+}
+
+func (dw *deferWriter) EncodeToken(t xml.Token) error {
+	if dw.w == nil {
+		dw.w = dw.s.TokenWriter()
+	}
+	return dw.w.EncodeToken(t)
+}
+
+func (dw *deferWriter) Close() error {
+	if dw.w == nil {
+		return nil
+	}
+	return dw.w.Close()
+}
+
+func (dw *deferWriter) Flush() error {
+	if dw.w == nil {
+		return nil
+	}
+	return dw.w.Flush()
+}
+
+// aLongTimeAgo is a convenient way to cancel dials.
+var aLongTimeAgo = time.Unix(1, 0)
 
 // SessionState is a bitmask that represents the current state of an XMPP
 // session. For a description of each bit, see the various SessionState typed
@@ -67,17 +120,25 @@ const (
 	// InputStreamClosed indicates that the input stream has been closed with a
 	// stream end tag. When set all read operations will return an error.
 	InputStreamClosed
+
+	// S2S indicates that this is a server-to-server connection.
+	S2S
 )
+
+type tokenReadChan struct {
+	stanzaName xml.Name
+	c          chan xmlstream.TokenReadCloser
+	ctx        context.Context
+}
 
 // A Session represents an XMPP session comprising an input and an output XML
 // stream.
 type Session struct {
-	conn net.Conn
+	conn      net.Conn
+	connState func() tls.ConnectionState
 
-	state SessionState
-
-	origin   jid.JID
-	location jid.JID
+	state      SessionState
+	stateMutex sync.RWMutex
 
 	// The stream feature namespaces advertised for the current streams.
 	features map[string]interface{}
@@ -85,41 +146,125 @@ type Session struct {
 	// The negotiated features (by namespace) for the current session.
 	negotiated map[string]struct{}
 
-	sentIQMutex sync.Mutex
-	sentIQs     map[string]chan xmlstream.TokenReadCloser
+	sentStanzaMutex sync.Mutex
+	sentStanzas     map[string]tokenReadChan
 
 	in struct {
-		intstream.Info
+		stream.Info
 		d      xml.TokenReader
 		ctx    context.Context
 		cancel context.CancelFunc
 		sync.Locker
 	}
 	out struct {
-		intstream.Info
-		e tokenWriteFlusher
+		stream.Info
+		e interface {
+			xmlstream.TokenWriter
+			xmlstream.Flusher
+		}
 		sync.Locker
 	}
+
+	ws bool
 }
 
-// NegotiateSession creates an XMPP session using a custom negotiate function.
-// Calling NegotiateSession with a nil Negotiator panics.
+var _ tlsConn = (*Session)(nil)
+
+// ConnectionState returns the underlying connection's TLS state or the zero
+// value if TLS has not been negotiated.
+func (s *Session) ConnectionState() tls.ConnectionState {
+	if s.connState == nil {
+		return tls.ConnectionState{}
+	}
+	return s.connState()
+}
+
+// NewSession creates an XMPP session from the initiating entity's perspective
+// using negotiate to manage the initial handshake.
+// Calling NewSession with a nil Negotiator panics.
 //
 // For more information see the Negotiator type.
-func NegotiateSession(ctx context.Context, location, origin jid.JID, rw io.ReadWriter, received bool, negotiate Negotiator) (*Session, error) {
+func NewSession(ctx context.Context, location, origin jid.JID, rw io.ReadWriter, state SessionState, negotiate Negotiator) (*Session, error) {
+	return negotiateSession(ctx, location, origin, rw, state, negotiate)
+}
+
+// ReceiveSession creates an XMPP session from the receiving server's
+// perspective using negotiate to manage the initial handshake.
+// Calling ReceiveSession with a nil Negotiator panics.
+//
+// For more information see the Negotiator type.
+func ReceiveSession(ctx context.Context, rw io.ReadWriter, state SessionState, negotiate Negotiator) (*Session, error) {
+	return negotiateSession(ctx, jid.JID{}, jid.JID{}, rw, Received|state, negotiate)
+}
+
+func setDeadline(ctx context.Context, conn net.Conn) context.CancelFunc {
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-ctx.Done():
+			/* #nosec */
+			conn.SetDeadline(aLongTimeAgo)
+			/* #nosec */
+			conn.SetDeadline(time.Time{})
+		case <-cancelCtx.Done():
+		}
+	}()
+	return cancel
+}
+
+func setWriteDeadline(ctx context.Context, conn net.Conn) context.CancelFunc {
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-ctx.Done():
+			/* #nosec */
+			conn.SetWriteDeadline(aLongTimeAgo)
+			/* #nosec */
+			conn.SetWriteDeadline(time.Time{})
+		case <-cancelCtx.Done():
+		}
+	}()
+	return cancel
+}
+
+func negotiateSession(ctx context.Context, location, origin jid.JID, rw io.ReadWriter, state SessionState, negotiate Negotiator) (*Session, error) {
 	if negotiate == nil {
 		panic("xmpp: attempted to negotiate session with nil negotiator")
 	}
-	s := &Session{
-		conn:       newConn(rw, nil),
-		origin:     origin,
-		location:   location,
-		features:   make(map[string]interface{}),
-		negotiated: make(map[string]struct{}),
-		sentIQs:    make(map[string]chan xmlstream.TokenReadCloser),
+
+	// If the ReadWriter is a net.Conn, respect context deadlines.
+	if conn, ok := rw.(net.Conn); ok {
+		defer setDeadline(ctx, conn)()
 	}
-	if received {
-		s.state |= Received
+
+	// This is a secret internal API that lets us use this same negotiator
+	// implementation in the websocket package without copy/pasting the entire
+	// implementation or creating import loops.
+	// For more information see the internal/wskey package.
+	wsCtx := ctx.Value(wskey.Key{})
+	s := &Session{
+		conn:        newConn(rw, nil),
+		features:    make(map[string]interface{}),
+		negotiated:  make(map[string]struct{}),
+		sentStanzas: make(map[string]tokenReadChan),
+		state:       state,
+		ws:          wsCtx != nil,
+	}
+
+	if s.state&Received == Received {
+		s.in.Info.To = location
+		s.in.Info.From = origin
+		s.out.Info.To = origin
+		s.out.Info.From = location
+	} else {
+		s.in.Info.To = origin
+		s.in.Info.From = location
+		s.out.Info.To = location
+		s.out.Info.From = origin
+	}
+
+	if tc, ok := s.conn.(tlsConn); ok {
+		s.connState = tc.ConnectionState
 	}
 	s.out.Locker = &sync.Mutex{}
 	s.in.Locker = &sync.Mutex{}
@@ -137,9 +282,20 @@ func NegotiateSession(ctx context.Context, location, origin jid.JID, rw io.ReadW
 	var data interface{}
 	for s.state&Ready == 0 {
 		var mask SessionState
-		var rw io.ReadWriter
 		var err error
-		mask, rw, data, err = negotiate(ctx, s, data)
+		// Clear the info if the stream was restarted (but preserve to/from so that
+		// we can verify that it has not changed).
+		if rw != nil {
+			s.in.Info = stream.Info{
+				To:   s.in.Info.To,
+				From: s.in.Info.From,
+			}
+			s.out.Info = stream.Info{
+				To:   s.out.Info.To,
+				From: s.out.Info.From,
+			}
+		}
+		mask, rw, data, err = negotiate(ctx, &s.in.Info, &s.out.Info, s, data)
 		if err != nil {
 			return s, err
 		}
@@ -151,20 +307,43 @@ func NegotiateSession(ctx context.Context, location, origin jid.JID, rw io.ReadW
 				delete(s.negotiated, k)
 			}
 			s.conn = newConn(rw, s.conn)
+			if tc, ok := s.conn.(tlsConn); ok {
+				s.connState = tc.ConnectionState
+			}
 			s.in.d = xml.NewDecoder(s.conn)
 			s.out.e = xml.NewEncoder(s.conn)
 		}
 		s.state |= mask
 	}
 
-	s.in.d = intstream.Reader(s.in.d)
-	s.out.e = stanzaAddID(s.out.e)
+	s.in.d = intstream.Reader(s.in.d, s.ws)
+	se := &stanzaEncoder{TokenWriteFlusher: s.out.e, ns: s.out.Info.XMLNS}
+	if s.out.Info.XMLNS == stanza.NSServer {
+		se.from = s.LocalAddr()
+	}
+	s.out.e = se
 
 	return s, nil
 }
 
+// DialSession uses a default client or server dialer to create a TCP connection
+// and attempts to negotiate an XMPP session over it.
+func DialSession(ctx context.Context, location, origin jid.JID, state SessionState, negotiate Negotiator) (*Session, error) {
+	var conn net.Conn
+	var err error
+	if state&S2S == S2S {
+		conn, err = dial.Server(ctx, "tcp", location)
+	} else {
+		conn, err = dial.Client(ctx, "tcp", origin)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return NewSession(ctx, location, origin, conn, state, negotiate)
+}
+
 // DialClientSession uses a default dialer to create a TCP connection and
-// attempts to negotiate an XMPP session over it.
+// attempts to negotiate an XMPP client-to-server session over it.
 //
 // If the provided context is canceled after stream negotiation is complete it
 // has no effect on the session.
@@ -173,11 +352,15 @@ func DialClientSession(ctx context.Context, origin jid.JID, features ...StreamFe
 	if err != nil {
 		return nil, err
 	}
-	return NegotiateSession(ctx, origin.Domain(), origin, conn, false, NewNegotiator(StreamConfig{Features: features}))
+	return NewSession(ctx, origin.Domain(), origin, conn, 0, NewNegotiator(func(*Session, *StreamConfig) StreamConfig {
+		return StreamConfig{
+			Features: features,
+		}
+	}))
 }
 
 // DialServerSession uses a default dialer to create a TCP connection and
-// attempts to negotiate an XMPP session over it.
+// attempts to negotiate an XMPP server-to-server session over it.
 //
 // If the provided context is canceled after stream negotiation is complete it
 // has no effect on the session.
@@ -186,29 +369,66 @@ func DialServerSession(ctx context.Context, location, origin jid.JID, features .
 	if err != nil {
 		return nil, err
 	}
-	return NegotiateSession(ctx, location, origin, conn, false, NewNegotiator(StreamConfig{S2S: true, Features: features}))
+	return NewSession(ctx, location, origin, conn, S2S, NewNegotiator(func(*Session, *StreamConfig) StreamConfig {
+		return StreamConfig{
+			Features: features,
+		}
+	}))
 }
 
 // NewClientSession attempts to use an existing connection (or any
-// io.ReadWriter) to negotiate an XMPP client-to-server session.
+// io.ReadWriter) to negotiate an XMPP client-to-server session from the
+// initiating client's perspective.
 // If the provided context is canceled before stream negotiation is complete an
 // error is returned.
 // After stream negotiation if the context is canceled it has no effect.
-func NewClientSession(ctx context.Context, origin jid.JID, rw io.ReadWriter, received bool, features ...StreamFeature) (*Session, error) {
-	return NegotiateSession(ctx, origin.Domain(), origin, rw, received, NewNegotiator(StreamConfig{
-		Features: features,
+func NewClientSession(ctx context.Context, origin jid.JID, rw io.ReadWriter, features ...StreamFeature) (*Session, error) {
+	return NewSession(ctx, origin.Domain(), origin, rw, 0, NewNegotiator(func(*Session, *StreamConfig) StreamConfig {
+		return StreamConfig{
+			Features: features,
+		}
+	}))
+}
+
+// ReceiveClientSession attempts to use an existing connection (or any
+// io.ReadWriter) to negotiate an XMPP client-to-server session from the
+// server's perspective.
+// If the provided context is canceled before stream negotiation is complete an
+// error is returned.
+// After stream negotiation if the context is canceled it has no effect.
+func ReceiveClientSession(ctx context.Context, origin jid.JID, rw io.ReadWriter, features ...StreamFeature) (*Session, error) {
+	return ReceiveSession(ctx, rw, 0, NewNegotiator(func(*Session, *StreamConfig) StreamConfig {
+		return StreamConfig{
+			Features: features,
+		}
 	}))
 }
 
 // NewServerSession attempts to use an existing connection (or any
-// io.ReadWriter) to negotiate an XMPP server-to-server session.
+// io.ReadWriter) to negotiate an XMPP server-to-server session from the
+// initiating server's perspective.
 // If the provided context is canceled before stream negotiation is complete an
 // error is returned.
 // After stream negotiation if the context is canceled it has no effect.
-func NewServerSession(ctx context.Context, location, origin jid.JID, rw io.ReadWriter, received bool, features ...StreamFeature) (*Session, error) {
-	return NegotiateSession(ctx, location, origin, rw, received, NewNegotiator(StreamConfig{
-		S2S:      true,
-		Features: features,
+func NewServerSession(ctx context.Context, location, origin jid.JID, rw io.ReadWriter, features ...StreamFeature) (*Session, error) {
+	return NewSession(ctx, location, origin, rw, S2S, NewNegotiator(func(*Session, *StreamConfig) StreamConfig {
+		return StreamConfig{
+			Features: features,
+		}
+	}))
+}
+
+// ReceiveServerSession attempts to use an existing connection (or any
+// io.ReadWriter) to negotiate an XMPP server-to-server session from the
+// receiving server's perspective.
+// If the provided context is canceled before stream negotiation is complete an
+// error is returned.
+// After stream negotiation if the context is canceled it has no effect.
+func ReceiveServerSession(ctx context.Context, location, origin jid.JID, rw io.ReadWriter, features ...StreamFeature) (*Session, error) {
+	return ReceiveSession(ctx, rw, S2S, NewNegotiator(func(*Session, *StreamConfig) StreamConfig {
+		return StreamConfig{
+			Features: features,
+		}
 	}))
 }
 
@@ -270,14 +490,16 @@ func (s *Session) Serve(h Handler) (err error) {
 func (s *Session) sendError(err error) (e error) {
 	s.out.Lock()
 	defer s.out.Unlock()
+	s.stateMutex.Lock()
+	defer s.stateMutex.Unlock()
 
 	if s.state&OutputStreamClosed == OutputStreamClosed {
 		return err
 	}
 
-	switch typErr := err.(type) {
-	case stream.Error:
-		if _, e = typErr.WriteXML(s.out.e); e != nil {
+	se := stream.Error{}
+	if errors.As(err, &se) {
+		if _, e = se.WriteXML(s.out.e); e != nil {
 			return e
 		}
 		if e = s.closeSession(); e != nil {
@@ -285,6 +507,7 @@ func (s *Session) sendError(err error) (e error) {
 		}
 		return err
 	}
+
 	// TODO: What should we do here? RFC 6120 §4.9.3.21. undefined-condition
 	// says:
 	//
@@ -292,6 +515,9 @@ func (s *Session) sendError(err error) (e error) {
 	//     conditions in this list; this error condition SHOULD NOT be used
 	//     except in conjunction with an application-specific condition.
 	if _, e = stream.UndefinedCondition.WriteXML(s.out.e); e != nil {
+		return e
+	}
+	if e = s.closeSession(); e != nil {
 		return e
 	}
 	return err
@@ -320,8 +546,9 @@ func (r iqResponder) Close() error {
 func handleInputStream(s *Session, handler Handler) (err error) {
 	discard := xmlstream.Discard()
 	rc := s.TokenReader()
+	/* #nosec */
 	defer rc.Close()
-	r := intstream.Reader(rc)
+	r := intstream.Reader(rc, s.ws)
 
 	tok, err := r.Token()
 	if err != nil {
@@ -333,20 +560,15 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 	case xml.StartElement:
 		start = t
 	case xml.CharData:
-		if len(bytes.TrimLeft(t, " \t\r\n")) != 0 {
-			// Whitespace is allowed, but anything else at the top of the stream is
-			// disallowed.
-			return stream.BadFormat
-		}
 		return nil
 	default:
 		// If this isn't a start element or a whitespace keepalive, the stream is in
 		// a bad state.
-		return stream.BadFormat
+		return fmt.Errorf("xmpp: stream in a bad state, expected start element or whitespace but got %T", tok)
 	}
 
 	// If this is a stanza, normalize the "from" attribute.
-	if isStanza(start.Name) {
+	if stanza.Is(start.Name, s.in.XMLNS) {
 		for i, attr := range start.Attr {
 			if attr.Name.Local == "from" /*&& attr.Name.Space == start.Name.Space*/ {
 				local := s.LocalAddr().Bare().String()
@@ -362,29 +584,24 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 		}
 	}
 
-	var id string
-	var needsResp bool
-	if isIQ(start.Name) {
-		_, id = attr.Get(start.Attr, "id")
+	iqOk := isIQ(start.Name)
+	_, _, id, typ := getIDTyp(start.Attr)
 
-		// If this is a response IQ (ie. an "error" or "result") check if we're
-		// handling it as part of a SendIQ call.
-		// If not, record this so that we can check if the user sends a response
-		// later.
-		if !iqNeedsResp(start.Attr) {
-			s.sentIQMutex.Lock()
-			c := s.sentIQs[id]
-			s.sentIQMutex.Unlock()
-			if c == nil {
-				goto noreply
-			}
-
+	if typ == string(stanza.ResultIQ) || typ == "error" {
+		s.sentStanzaMutex.Lock()
+		readerChan, ok := s.sentStanzas[id]
+		s.sentStanzaMutex.Unlock()
+		emptySpace := xml.Name{Local: start.Name.Local}
+		if ok && readerChan.stanzaName == start.Name || readerChan.stanzaName == emptySpace {
 			inner := xmlstream.Inner(r)
-			c <- iqResponder{
-				r: xmlstream.MultiReader(xmlstream.Token(start), inner, xmlstream.Token(start.End())),
-				c: c,
+			select {
+			case readerChan.c <- iqResponder{
+				r: xmlstream.Wrap(inner, start),
+				c: readerChan.c,
+			}:
+				<-readerChan.c
+			case <-readerChan.ctx.Done():
 			}
-			<-c
 			// Consume the rest of the stream before continuing the loop.
 			_, err = xmlstream.Copy(discard, inner)
 			if err != nil {
@@ -392,15 +609,15 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 			}
 			return nil
 		}
-		needsResp = true
 	}
 
-noreply:
-
-	w := s.TokenWriter()
+	w := &deferWriter{s: s}
 	defer w.Close()
 	rw := &responseChecker{
-		TokenReader: xmlstream.MultiReader(xmlstream.Inner(r), xmlstream.Token(start.End())),
+		TokenReader: earlyCloser{
+			r: xmlstream.InnerElement(r),
+			c: rc,
+		},
 		TokenWriter: w,
 		id:          id,
 	}
@@ -408,11 +625,21 @@ noreply:
 		return err
 	}
 
+	iqNeedsResp := typ == string(stanza.GetIQ) || typ == string(stanza.SetIQ)
 	// If the user did not write a response to an IQ, send a default one.
-	if needsResp && !rw.wroteResp {
+	if iqOk && iqNeedsResp && !rw.wroteResp {
+		_, fromAttr := attr.Get(start.Attr, "from")
+		var to jid.JID
+		if fromAttr != "" {
+			to, err = jid.Parse(fromAttr)
+			if err != nil {
+				return err
+			}
+		}
 		_, err := xmlstream.Copy(w, stanza.IQ{
 			ID:   id,
 			Type: stanza.ErrorIQ,
+			To:   to,
 		}.Wrap(stanza.Error{
 			Type:      stanza.Cancel,
 			Condition: stanza.ServiceUnavailable,
@@ -432,6 +659,26 @@ noreply:
 	return err
 }
 
+func getIDTyp(attrs []xml.Attr) (int, int, string, string) {
+	var id, typ string
+	idIdx := -1
+	typIdx := -1
+	for idx, attr := range attrs {
+		switch attr.Name.Local {
+		case "id":
+			id = attr.Value
+			idIdx = idx
+		case "type":
+			typ = attr.Value
+			typIdx = idx
+		}
+		if idIdx > -1 && typIdx > -1 {
+			break
+		}
+	}
+	return idIdx, typIdx, id, typ
+}
+
 type responseChecker struct {
 	xml.TokenReader
 	xmlstream.TokenWriter
@@ -443,8 +690,8 @@ type responseChecker struct {
 func (rw *responseChecker) EncodeToken(t xml.Token) error {
 	switch tok := t.(type) {
 	case xml.StartElement:
-		_, id := attr.Get(tok.Attr, "id")
-		if rw.level < 1 && isIQEmptySpace(tok.Name) && id == rw.id && !iqNeedsResp(tok.Attr) {
+		_, _, id, typ := getIDTyp(tok.Attr)
+		if rw.level < 1 && isIQEmptySpace(tok.Name) && id == rw.id && (typ != string(stanza.GetIQ) && typ != string(stanza.SetIQ)) {
 			rw.wroteResp = true
 		}
 		rw.level++
@@ -491,9 +738,12 @@ func (lwc *lockWriteCloser) EncodeToken(t xml.Token) error {
 		return lwc.err
 	}
 
+	lwc.w.stateMutex.RLock()
 	if lwc.w.state&OutputStreamClosed == OutputStreamClosed {
+		lwc.w.stateMutex.RUnlock()
 		return ErrOutputStreamClosed
 	}
+	lwc.w.stateMutex.RUnlock()
 
 	return lwc.w.out.e.EncodeToken(t)
 }
@@ -502,9 +752,12 @@ func (lwc *lockWriteCloser) Flush() error {
 	if lwc.err != nil {
 		return nil
 	}
+	lwc.w.stateMutex.RLock()
 	if lwc.w.state&OutputStreamClosed == OutputStreamClosed {
+		lwc.w.stateMutex.RUnlock()
 		return ErrOutputStreamClosed
 	}
+	lwc.w.stateMutex.RUnlock()
 	return lwc.w.out.e.Flush()
 }
 
@@ -512,8 +765,12 @@ func (lwc *lockWriteCloser) Close() error {
 	if lwc.err != nil {
 		return nil
 	}
+	defer lwc.m.Unlock()
+	if err := lwc.Flush(); err != nil {
+		lwc.err = err
+		return err
+	}
 	lwc.err = io.EOF
-	lwc.m.Unlock()
 	return nil
 }
 
@@ -528,9 +785,12 @@ func (lrc *lockReadCloser) Token() (xml.Token, error) {
 		return nil, lrc.err
 	}
 
+	lrc.s.stateMutex.RLock()
 	if lrc.s.state&InputStreamClosed == InputStreamClosed {
+		lrc.s.stateMutex.RUnlock()
 		return nil, ErrInputStreamClosed
 	}
+	lrc.s.stateMutex.RUnlock()
 
 	return lrc.s.in.d.Token()
 }
@@ -581,6 +841,8 @@ func (s *Session) TokenReader() xmlstream.TokenReadCloser {
 func (s *Session) Close() error {
 	s.out.Lock()
 	defer s.out.Unlock()
+	s.stateMutex.Lock()
+	defer s.stateMutex.Unlock()
 
 	return s.closeSession()
 }
@@ -593,32 +855,37 @@ func (s *Session) closeSession() error {
 	s.state |= OutputStreamClosed
 	// We wrote the opening stream instead of encoding it, so do the same with the
 	// closing to ensure that the encoder doesn't think the tokens are mismatched.
-	_, err := s.Conn().Write([]byte(closeStreamTag))
-	return err
+	return intstream.Close(s.Conn(), &s.out.Info)
 }
 
 // State returns the current state of the session. For more information, see the
 // SessionState type.
 func (s *Session) State() SessionState {
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
 	return s.state
+}
+
+// In returns information about the input stream.
+func (s *Session) In() stream.Info {
+	return s.in.Info
+}
+
+// Out returns information about the output stream.
+func (s *Session) Out() stream.Info {
+	return s.out.Info
 }
 
 // LocalAddr returns the Origin address for initiated connections, or the
 // Location for received connections.
 func (s *Session) LocalAddr() jid.JID {
-	if (s.state & Received) == Received {
-		return s.location
-	}
-	return s.origin
+	return s.in.Info.To
 }
 
 // RemoteAddr returns the Location address for initiated connections, or the
 // Origin address for received connections.
 func (s *Session) RemoteAddr() jid.JID {
-	if (s.state & Received) == Received {
-		return s.origin
-	}
-	return s.location
+	return s.in.Info.From
 }
 
 // SetCloseDeadline sets a deadline for the input stream to be closed by the
@@ -638,10 +905,11 @@ func (s *Session) SetCloseDeadline(t time.Time) error {
 // Encode writes the XML encoding of v to the stream.
 //
 // For more information see "encoding/xml".Encode.
-func (s *Session) Encode(v interface{}) error {
+func (s *Session) Encode(ctx context.Context, v interface{}) error {
 	s.out.Lock()
 	defer s.out.Unlock()
 
+	defer setWriteDeadline(ctx, s.conn)()
 	return marshal.EncodeXML(s.out.e, v)
 }
 
@@ -649,10 +917,11 @@ func (s *Session) Encode(v interface{}) error {
 // outermost tag in the encoding.
 //
 // For more information see "encoding/xml".EncodeElement.
-func (s *Session) EncodeElement(v interface{}, start xml.StartElement) error {
+func (s *Session) EncodeElement(ctx context.Context, v interface{}, start xml.StartElement) error {
 	s.out.Lock()
 	defer s.out.Unlock()
 
+	defer setWriteDeadline(ctx, s.conn)()
 	return marshal.EncodeXMLElement(s.out.e, v, start)
 }
 
@@ -660,7 +929,7 @@ func (s *Session) EncodeElement(v interface{}, start xml.StartElement) error {
 //
 // Send is safe for concurrent use by multiple goroutines.
 func (s *Session) Send(ctx context.Context, r xml.TokenReader) error {
-	return send(s, r, nil)
+	return send(ctx, s, r, nil)
 }
 
 // SendElement is like Send except that it uses start as the outermost tag in
@@ -668,12 +937,14 @@ func (s *Session) Send(ctx context.Context, r xml.TokenReader) error {
 //
 // SendElement is safe for concurrent use by multiple goroutines.
 func (s *Session) SendElement(ctx context.Context, r xml.TokenReader, start xml.StartElement) error {
-	return send(s, r, &start)
+	return send(ctx, s, r, &start)
 }
 
-func send(s *Session, r xml.TokenReader, start *xml.StartElement) error {
+func send(ctx context.Context, s *Session, r xml.TokenReader, start *xml.StartElement) error {
 	s.out.Lock()
 	defer s.out.Unlock()
+
+	defer setWriteDeadline(ctx, s.conn)()
 
 	if start == nil {
 		tok, err := r.Token()
@@ -704,106 +975,33 @@ func send(s *Session, r xml.TokenReader, start *xml.StartElement) error {
 	return s.out.e.Flush()
 }
 
-func iqNeedsResp(attrs []xml.Attr) bool {
-	var typ string
-	for _, attr := range attrs {
-		if attr.Name.Local == "type" {
-			typ = attr.Value
-			break
-		}
-	}
-
-	return typ == string(stanza.GetIQ) || typ == string(stanza.SetIQ)
-}
-
 func isIQ(name xml.Name) bool {
-	return name.Local == "iq" && (name.Space == ns.Client || name.Space == ns.Server)
+	return name.Local == "iq" && (name.Space == stanza.NSClient || name.Space == stanza.NSServer)
 }
 
 func isIQEmptySpace(name xml.Name) bool {
-	return name.Local == "iq" && (name.Space == "" || name.Space == ns.Client || name.Space == ns.Server)
+	return name.Local == "iq" && (name.Space == "" || name.Space == stanza.NSClient || name.Space == stanza.NSServer)
 }
 
-func isStanza(name xml.Name) bool {
+func isStanzaEmptySpace(name xml.Name) bool {
 	return (name.Local == "iq" || name.Local == "message" || name.Local == "presence") &&
-		(name.Space == ns.Client || name.Space == ns.Server)
-}
-
-// SendIQ is like Send except that it returns an error if the first token read
-// from the stream is not an Info/Query (IQ) start element and blocks until a
-// response is received.
-//
-// If the input stream is not being processed (a call to Serve is not running),
-// SendIQ will never receive a response and will block until the provided
-// context is canceled.
-// If the response is non-nil, it does not need to be consumed in its entirety,
-// but it must be closed before stream processing will resume.
-// If the IQ type does not require a response—ie. it is a result or error IQ,
-// meaning that it is a response itself—SendIQElemnt does not block and the
-// response is nil.
-//
-// If the context is closed before the response is received, SendIQ immediately
-// returns the context error.
-// Any response received at a later time will not be associated with the
-// original request but can still be handled by the Serve handler.
-//
-// If an error is returned, the response will be nil; the converse is not
-// necessarily true.
-// SendIQ is safe for concurrent use by multiple goroutines.
-func (s *Session) SendIQ(ctx context.Context, r xml.TokenReader) (xmlstream.TokenReadCloser, error) {
-	tok, err := r.Token()
-	if err != nil {
-		return nil, err
-	}
-	start, ok := tok.(xml.StartElement)
-	if !ok {
-		return nil, fmt.Errorf("expected IQ start element, got %T", tok)
-	}
-	if !isIQEmptySpace(start.Name) {
-		return nil, fmt.Errorf("expected start element to be an IQ")
-	}
-
-	// If there's no ID, add one.
-	idx, id := attr.Get(start.Attr, "id")
-	if idx == -1 {
-		idx = len(start.Attr)
-		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "id"}, Value: ""})
-	}
-	if id == "" {
-		id = attr.RandomID()
-		start.Attr[idx].Value = id
-	}
-
-	// If this an IQ of type "set" or "get" we expect a response.
-	if iqNeedsResp(start.Attr) {
-		// return s.sendResp(ctx, id, xmlstream.Wrap(r, start))
-		return s.sendResp(ctx, id, xmlstream.Inner(r), start)
-	}
-
-	// If this is an IQ of type result or error, we don't expect a response so
-	// just send it normally.
-	return nil, s.SendElement(ctx, xmlstream.Inner(r), start)
-}
-
-// SendIQElement is like SendIQ except that it wraps the payload in an
-// Info/Query (IQ) element.
-// For more information, see SendIQ.
-//
-// SendIQElement is safe for concurrent use by multiple goroutines.
-func (s *Session) SendIQElement(ctx context.Context, payload xml.TokenReader, iq stanza.IQ) (xmlstream.TokenReadCloser, error) {
-	return s.SendIQ(ctx, iq.Wrap(payload))
+		(name.Space == stanza.NSClient || name.Space == stanza.NSServer || name.Space == "")
 }
 
 func (s *Session) sendResp(ctx context.Context, id string, payload xml.TokenReader, start xml.StartElement) (xmlstream.TokenReadCloser, error) {
 	c := make(chan xmlstream.TokenReadCloser)
 
-	s.sentIQMutex.Lock()
-	s.sentIQs[id] = c
-	s.sentIQMutex.Unlock()
+	s.sentStanzaMutex.Lock()
+	s.sentStanzas[id] = tokenReadChan{
+		stanzaName: start.Name,
+		c:          c,
+		ctx:        ctx,
+	}
+	s.sentStanzaMutex.Unlock()
 	defer func() {
-		s.sentIQMutex.Lock()
-		delete(s.sentIQs, id)
-		s.sentIQMutex.Unlock()
+		s.sentStanzaMutex.Lock()
+		delete(s.sentStanzas, id)
+		s.sentStanzaMutex.Unlock()
 	}()
 
 	err := s.SendElement(ctx, payload, start)
@@ -815,7 +1013,6 @@ func (s *Session) sendResp(ctx context.Context, id string, payload xml.TokenRead
 	case rr := <-c:
 		return rr, nil
 	case <-ctx.Done():
-		close(c)
 		return nil, ctx.Err()
 	}
 }
@@ -825,49 +1022,101 @@ func (s *Session) sendResp(ctx context.Context, id string, payload xml.TokenRead
 func (s *Session) closeInputStream() {
 	s.in.Lock()
 	defer s.in.Unlock()
+	s.stateMutex.Lock()
+	defer s.stateMutex.Unlock()
 	s.state |= InputStreamClosed
 	s.in.cancel()
 }
 
-type wrapWriter struct {
-	encode func(t xml.Token) error
-	flush  func() error
+type stanzaEncoder struct {
+	xmlstream.TokenWriteFlusher
+	depth int
+	from  jid.JID
+	ns    string
 }
 
-func (w wrapWriter) EncodeToken(t xml.Token) error { return w.encode(t) }
-func (w wrapWriter) Flush() error                  { return w.flush() }
-
-type tokenWriteFlusher interface {
-	xmlstream.TokenWriter
-	xmlstream.Flusher
-}
-
-func stanzaAddID(w tokenWriteFlusher) tokenWriteFlusher {
-	depth := 0
-	return wrapWriter{
-		encode: func(t xml.Token) error {
-		tokswitch:
-			switch tok := t.(type) {
-			case xml.StartElement:
-				depth++
-				if depth == 1 && tok.Name.Local == "iq" {
-					for _, attr := range tok.Attr {
-						if attr.Name.Local == "id" {
-							break tokswitch
-						}
-					}
-					tok.Attr = append(tok.Attr, xml.Attr{
-						Name:  xml.Name{Local: "id"},
-						Value: attr.RandomID(),
-					})
-					t = tok
-				}
-			case xml.EndElement:
-				depth--
+func (se *stanzaEncoder) EncodeToken(t xml.Token) error {
+	switch tok := t.(type) {
+	case xml.StartElement:
+		se.depth++
+		// Add required attributes if missing:
+		if se.depth == 1 && isStanzaEmptySpace(tok.Name) {
+			if tok.Name.Space == "" {
+				tok.Name.Space = se.ns
 			}
+			var foundID, foundFrom bool
+			attrs := tok.Attr[:0]
+			for _, attr := range tok.Attr {
+				switch attr.Name.Local {
+				case "id":
+					// RFC6120 § 8.1.3
+					// For <message/> and <presence/> stanzas, it is RECOMMENDED for the
+					// originating entity to include an 'id' attribute; for <iq/> stanzas,
+					// it is REQUIRED.
+					if attr.Value == "" {
+						continue
+					}
+					foundID = true
+				case "from":
+					// RFC6120 § 4.7.1
+					// the 'to' and 'from' attributes are OPTIONAL on stanzas sent over
+					// XML streams qualified by the 'jabber:client' namespace, whereas
+					// they are REQUIRED on stanzas sent over XML streams qualified by the
+					// 'jabber: server' namespace
+					if attr.Value == "" {
+						continue
+					}
+					foundFrom = true
+				}
+				attrs = append(attrs, attr)
+			}
+			tok.Attr = attrs
+			if f := se.from.String(); f != "" && !foundFrom {
+				tok.Attr = append(tok.Attr, xml.Attr{
+					Name:  xml.Name{Local: "from"},
+					Value: se.from.String(),
+				})
+			}
+			if !foundID {
+				tok.Attr = append(tok.Attr, xml.Attr{
+					Name:  xml.Name{Local: "id"},
+					Value: attr.RandomID(),
+				})
+			}
+		}
 
-			return w.EncodeToken(t)
-		},
-		flush: w.Flush,
+		// For all start elements, regardless of depth, prevent duplicate xmlns
+		// attributes. See https://mellium.im/issue/75
+		attrs := tok.Attr[:0]
+		for _, attr := range tok.Attr {
+			if attr.Name.Local == "xmlns" && tok.Name.Space != "" {
+				continue
+			}
+			attrs = append(attrs, attr)
+		}
+		tok.Attr = attrs
+		t = tok
+	case xml.EndElement:
+		if se.depth == 1 && tok.Name.Space == "" && isStanzaEmptySpace(tok.Name) {
+			tok.Name.Space = se.ns
+			t = tok
+		}
+		se.depth--
 	}
+
+	return se.TokenWriteFlusher.EncodeToken(t)
+}
+
+// UpdateAddr sets the address used by the session.
+// If the Ready state bit is already set, UpdateAddr has no effect and ok will
+// be false.
+func (s *Session) UpdateAddr(j jid.JID) (ok bool) {
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
+	if s.state&Ready == Ready {
+		return false
+	}
+	s.in.Info.To = j
+	s.out.Info.From = j
+	return true
 }

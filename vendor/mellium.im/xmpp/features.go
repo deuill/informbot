@@ -8,10 +8,13 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 
 	"mellium.im/xmlstream"
+	"mellium.im/xmpp/internal/decl"
 	"mellium.im/xmpp/internal/ns"
+	intstream "mellium.im/xmpp/internal/stream"
 	"mellium.im/xmpp/stream"
 )
 
@@ -29,6 +32,8 @@ type StreamFeature struct {
 	// The XML name of the feature in the <stream:feature/> list. If a start
 	// element with this name is seen while the connection is reading the features
 	// list, it will trigger this StreamFeature's Parse function as a callback.
+	// If the stream feature is a legacy feature like resource binding that uses
+	// an IQ for negotiation, this should be the name of the IQ payload.
 	Name xml.Name
 
 	// Bits that are required before this feature is advertised. For instance, if
@@ -45,9 +50,7 @@ type StreamFeature struct {
 
 	// Used to send the feature in a features list for server connections. The
 	// start element will have a name that matches the features name and should be
-	// used as the outermost tag in the stream (but also may be ignored). List
-	// implementations that call e.EncodeToken directly need to call e.Flush when
-	// finished to ensure that the XML is written to the underlying writer.
+	// used as the outermost tag in the stream (but also may be ignored).
 	List func(ctx context.Context, e xmlstream.TokenWriter, start xml.StartElement) (req bool, err error)
 
 	// Used to parse the feature that begins with the given xml start element
@@ -55,7 +58,7 @@ type StreamFeature struct {
 	// Returns whether or not the feature is required, and any data that will be
 	// needed if the feature is selected for negotiation (eg. the list of
 	// mechanisms if the feature was SASL authentication).
-	Parse func(ctx context.Context, r xml.TokenReader, start *xml.StartElement) (req bool, data interface{}, err error)
+	Parse func(ctx context.Context, d *xml.Decoder, start *xml.StartElement) (req bool, data interface{}, err error)
 
 	// A function that will take over the session temporarily while negotiating
 	// the feature. The "mask" SessionState represents the state bits that should
@@ -70,6 +73,10 @@ type StreamFeature struct {
 	// Negotiate is called. For instance, in the case of compression this data
 	// parameter might be the list of supported algorithms as a slice of strings
 	// (or in whatever format the feature implementation has decided upon).
+	//
+	// If Negotiate is nil the stream feature will not be negotiated but will
+	// still be listed or parsed. This can be used to implement informational
+	// stream features.
 	Negotiate func(ctx context.Context, session *Session, data interface{}) (mask SessionState, rw io.ReadWriter, err error)
 }
 
@@ -83,13 +90,25 @@ func containsStartTLS(features []StreamFeature) (startTLS StreamFeature, ok bool
 	return startTLS, ok
 }
 
-func negotiateFeatures(ctx context.Context, s *Session, first bool, features []StreamFeature) (mask SessionState, rw io.ReadWriter, err error) {
+func decodeStreamErr(start xml.StartElement, r xml.TokenReader) error {
+	if start.Name.Local != "error" || start.Name.Space != stream.NS {
+		return nil
+	}
+	e := stream.Error{}
+	err := xml.NewTokenDecoder(r).DecodeElement(&e, &start)
+	if err != nil {
+		return err
+	}
+	return e
+}
+
+func negotiateFeatures(ctx context.Context, s *Session, first, ws bool, features []StreamFeature) (mask SessionState, rw io.ReadWriter, err error) {
 	server := (s.state & Received) == Received
 
 	// If we're the server, write the initial stream features.
 	var list *streamFeaturesList
 	if server {
-		list, err = writeStreamFeatures(ctx, s, features)
+		list, err = writeStreamFeatures(ctx, s, ws, features)
 		if err != nil {
 			return mask, nil, err
 		}
@@ -109,7 +128,12 @@ func negotiateFeatures(ctx context.Context, s *Session, first bool, features []S
 		}
 		start, ok = t.(xml.StartElement)
 		if !ok {
-			return mask, nil, stream.BadFormat
+			return mask, nil, fmt.Errorf("xmpp: received invalid feature list of type %T", t)
+		}
+		// Unmarshal any stream errors and return them.
+		err = decodeStreamErr(start, s.in.d)
+		if err != nil {
+			return mask, nil, err
 		}
 
 		// If we're the client read the rest of the stream features list.
@@ -150,6 +174,7 @@ func negotiateFeatures(ctx context.Context, s *Session, first bool, features []S
 	for {
 		var data sfData
 
+		oldDecoder := s.in.d
 		if server {
 			// Read a new feature to negotiate.
 			t, err = s.in.d.Token()
@@ -158,16 +183,49 @@ func negotiateFeatures(ctx context.Context, s *Session, first bool, features []S
 			}
 			start, ok = t.(xml.StartElement)
 			if !ok {
-				return mask, nil, stream.BadFormat
+				return mask, nil, fmt.Errorf("xmpp: received invalid start to feature of type %T", t)
+			}
+			// If this is an IQ (used by legacy features such as resource binding),
+			// unwrap it and use the payload's namespace to determine which feature to
+			// select.
+			// It will be up to the stream feature to actually respond to the IQ
+			// correctly.
+			var iqStart xml.StartElement
+			if isIQ(start.Name) {
+				iqStart = start
+				t, err = decl.TrimLeftSpace(s.in.d).Token()
+				if err != nil {
+					return mask, nil, err
+				}
+				start, ok = t.(xml.StartElement)
+				if !ok {
+					return mask, nil, fmt.Errorf("xmpp: received IQ with invalid payload of type %T", t)
+				}
 			}
 
-			// If the feature was not sent or was already negotiated, error.
-
+			// If the feature was not sent, was already negotiated, or is
+			// informational only and not meant to be negotiated: error.
 			_, negotiated := s.negotiated[start.Name.Space]
 			data, sent = list.cache[start.Name.Space]
-			if !sent || negotiated {
+			if !sent || negotiated || data.feature.Negotiate == nil {
 				// TODO: What should we return here?
 				return mask, rw, stream.PolicyViolation
+			}
+
+			// Add the start element(s) that we popped back so that the negotiate
+			// function can create a token decoder and have tokens match up and decode
+			// things properly.
+			if iqStart.Name.Local == "" {
+				s.in.d = xmlstream.MultiReader(
+					xmlstream.Token(start),
+					intstream.Reader(oldDecoder, ws),
+				)
+			} else {
+				s.in.d = xmlstream.MultiReader(
+					xmlstream.Token(iqStart),
+					xmlstream.Token(start),
+					intstream.Reader(oldDecoder, ws),
+				)
 			}
 		} else {
 			// If we need to try and negotiate StartTLS even though it wasn't
@@ -178,11 +236,12 @@ func negotiateFeatures(ctx context.Context, s *Session, first bool, features []S
 					feature: startTLS,
 				}
 			} else {
-				// If we're the client, iterate through the cached features and select one
-				// to negotiate.
+				// If we're the client, iterate through the cached features and select
+				// one to negotiate.
 				for _, v := range list.cache {
-					if _, ok := s.negotiated[v.feature.Name.Space]; ok {
-						// If this feature has already been negotiated, skip it.
+					if _, ok := s.negotiated[v.feature.Name.Space]; ok || v.feature.Negotiate == nil {
+						// If this feature has already been negotiated, or is informational
+						// only with no negotiation, skip it.
 						continue
 					}
 
@@ -192,11 +251,9 @@ func negotiateFeatures(ctx context.Context, s *Session, first bool, features []S
 						break
 					}
 
-					// If the feature is required, tentatively select it (but finish looking
-					// for optional features).
-					if v.req {
-						data = v
-					}
+					// If the feature is required, tentatively select it (but finish
+					// looking for optional features).
+					data = v
 				}
 			}
 
@@ -204,9 +261,11 @@ func negotiateFeatures(ctx context.Context, s *Session, first bool, features []S
 			if data.feature.Name.Local == "" {
 				return Ready, nil, nil
 			}
+			s.in.d = intstream.Reader(oldDecoder, ws)
 		}
 
-		mask, rw, err = data.feature.Negotiate(ctx, s, data.data)
+		mask, rw, err = data.feature.Negotiate(ctx, s, s.features[data.feature.Name.Space])
+		s.in.d = oldDecoder
 		if err == nil {
 			s.state |= mask
 		}
@@ -219,7 +278,8 @@ func negotiateFeatures(ctx context.Context, s *Session, first bool, features []S
 		}
 	}
 
-	// If the list contains no required features, negotiation is complete.
+	// If the list contains no required features and a stream restart is not
+	// required,  negotiation is complete.
 	if !list.req {
 		mask |= Ready
 	}
@@ -229,7 +289,6 @@ func negotiateFeatures(ctx context.Context, s *Session, first bool, features []S
 
 type sfData struct {
 	req     bool
-	data    interface{}
 	feature StreamFeature
 }
 
@@ -250,8 +309,15 @@ func getFeature(name xml.Name, features []StreamFeature) (feature StreamFeature,
 	return feature, false
 }
 
-func writeStreamFeatures(ctx context.Context, s *Session, features []StreamFeature) (list *streamFeaturesList, err error) {
-	start := xml.StartElement{Name: xml.Name{Space: "", Local: "stream:features"}}
+func writeStreamFeatures(ctx context.Context, s *Session, ws bool, features []StreamFeature) (list *streamFeaturesList, err error) {
+	var start xml.StartElement
+	if ws {
+		// There is no wrapping "stream:stream" element in the websocket
+		// subprotocol, so set the namespace using the unprefixed form.
+		start.Name = xml.Name{Space: stream.NS, Local: "features"}
+	} else {
+		start.Name = xml.Name{Local: "stream:features"}
+	}
 	w := s.TokenWriter()
 	defer w.Close()
 	if err = w.EncodeToken(start); err != nil {
@@ -266,7 +332,8 @@ func writeStreamFeatures(ctx context.Context, s *Session, features []StreamFeatu
 	for _, feature := range features {
 		// Check if all the necessary bits are set and none of the prohibited bits
 		// are set.
-		if (s.state&feature.Necessary) == feature.Necessary && (s.state&feature.Prohibited) == 0 {
+		if (s.state&feature.Necessary) == feature.Necessary &&
+			(s.state&feature.Prohibited) == 0 {
 			var r bool
 			r, err = feature.List(ctx, s.out.e, xml.StartElement{
 				Name: feature.Name,
@@ -276,7 +343,6 @@ func writeStreamFeatures(ctx context.Context, s *Session, features []StreamFeatu
 			}
 			list.cache[feature.Name.Space] = sfData{
 				req:     r,
-				data:    nil,
 				feature: feature,
 			}
 			if r {
@@ -292,6 +358,22 @@ func writeStreamFeatures(ctx context.Context, s *Session, features []StreamFeatu
 		return list, err
 	}
 	return list, err
+}
+
+func nextElementDecoder(r xml.TokenReader, start xml.StartElement) *xml.Decoder {
+	d := xml.NewTokenDecoder(xmlstream.MultiReader(
+		xmlstream.Token(start),
+		xmlstream.InnerElement(r),
+	))
+	// This isn't ideal, but we have to provide the start element to the decoder
+	// and then pop it and ignore it (since it had already been read fro mthe
+	// underlying reader) to setup the internal state of the new decoder.
+	// This was the only way I could contrive to provide Parse calls with a
+	// Decoder that won't error when it reaches the end token.
+
+	/* #nosec */
+	d.Token()
+	return d
 }
 
 func readStreamFeatures(ctx context.Context, s *Session, start xml.StartElement, features []StreamFeature) (*streamFeaturesList, error) {
@@ -314,40 +396,43 @@ parsefeatures:
 		}
 		switch tok := t.(type) {
 		case xml.StartElement:
+			limitDecoder := nextElementDecoder(s.in.d, tok)
+
 			// If the token is a new feature, see if it's one we handle. If so, parse
 			// it. Increment the total features count regardless.
 			sf.total++
 
 			// Always add the feature to the list of features, even if we don't
-			// support it.
+			// support it, it just won't contain any parse output.
 			s.features[tok.Name.Space] = nil
 
 			feature, ok := getFeature(tok.Name, features)
-
-			if ok && s.state&feature.Necessary == feature.Necessary && s.state&feature.Prohibited == 0 {
-				req, data, err := feature.Parse(ctx, s.in.d, &tok)
+			if ok {
+				req, data, err := feature.Parse(ctx, limitDecoder, &tok)
 				if err != nil {
 					return nil, err
 				}
+				sf.req = sf.req || req
 
-				// TODO: Since we're storing the features data on s.features we can
-				// probably remove it from this temporary cache.
-				sf.cache[tok.Name.Space] = sfData{
-					req:     req,
-					data:    data,
-					feature: feature,
-				}
+				if s.state&feature.Necessary == feature.Necessary &&
+					s.state&feature.Prohibited == 0 {
 
-				// Since we do support the feature, add it to the connections list along
-				// with any data returned from Parse.
-				s.features[tok.Name.Space] = data
-				if req {
-					sf.req = true
+					sf.cache[tok.Name.Space] = sfData{
+						req:     req,
+						feature: feature,
+					}
+
+					// Since we do support the feature, add it to the connections list
+					// along with any data returned from Parse.
+					s.features[tok.Name.Space] = data
+					continue parsefeatures
 				}
-				continue parsefeatures
 			}
-			// If the feature is not one we support, skip it.
-			if err := xmlstream.Skip(s.in.d); err != nil {
+			// Advance to the end of the feature element (in case the parse function
+			// didn't consume the entire feature or we did not support the feature and
+			// need to skip it).
+			_, err := xmlstream.Copy(xmlstream.Discard(), limitDecoder)
+			if err != nil {
 				return nil, err
 			}
 		case xml.EndElement:

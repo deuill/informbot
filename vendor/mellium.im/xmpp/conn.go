@@ -5,15 +5,27 @@
 package xmpp
 
 import (
+	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"time"
 )
 
+var _ tlsConn = (*teeConn)(nil)
+var _ tlsConn = (*conn)(nil)
+
+type tlsConn interface {
+	ConnectionState() tls.ConnectionState
+}
+
 // conn is a net.Conn created for the purpose of establishing an XMPP session.
 type conn struct {
-	c  net.Conn
-	rw io.ReadWriter
+	c         net.Conn
+	rw        io.ReadWriter
+	rd        func(time.Time) error
+	wd        func(time.Time) error
+	connState func() tls.ConnectionState
 }
 
 // newConn wraps an io.ReadWriter in a Conn.
@@ -25,8 +37,43 @@ func newConn(rw io.ReadWriter, prev net.Conn) net.Conn {
 		return c
 	}
 
-	nc := &conn{rw: rw, c: prev}
+	// Pull out a connection state function if possible.
+	tc, ok := rw.(tlsConn)
+	if !ok {
+		tc, _ = prev.(tlsConn)
+	}
+	var cs func() tls.ConnectionState
+	if tc != nil {
+		cs = tc.ConnectionState
+	}
+
+	var rd, wd func(time.Time) error
+	if rdPrev, ok := prev.(interface {
+		SetReadDeadline(time.Time) error
+	}); ok {
+		rd = rdPrev.SetReadDeadline
+	}
+	if wdPrev, ok := prev.(interface {
+		SetWriteDeadline(time.Time) error
+	}); ok {
+		wd = wdPrev.SetWriteDeadline
+	}
+
+	nc := &conn{
+		rw:        rw,
+		c:         prev,
+		rd:        rd,
+		wd:        wd,
+		connState: cs,
+	}
 	return nc
+}
+
+func (c *conn) ConnectionState() tls.ConnectionState {
+	if c.connState == nil {
+		return tls.ConnectionState{}
+	}
+	return c.connState()
 }
 
 // Close closes the connection.
@@ -73,10 +120,10 @@ func (c *conn) SetDeadline(t time.Time) error {
 // SetReadDeadline sets the read deadline on the underlying connection.
 // A zero value for t means Read will not time out.
 func (c *conn) SetReadDeadline(t time.Time) error {
-	if c.c == nil {
+	if c.rd == nil {
 		return nil
 	}
-	return c.c.SetReadDeadline(t)
+	return c.rd(t)
 }
 
 // SetWriteDeadline sets the write deadline on the underlying connection.
@@ -84,13 +131,73 @@ func (c *conn) SetReadDeadline(t time.Time) error {
 // After a Write has timed out, the TLS state is corrupt and all future writes
 // will return the same error.
 func (c *conn) SetWriteDeadline(t time.Time) error {
-	if c.c == nil {
+	if c.wd == nil {
 		return nil
 	}
-	return c.c.SetWriteDeadline(t)
+	return c.wd(t)
 }
 
 // Write writes data to the connection.
 func (c *conn) Write(b []byte) (int, error) {
 	return c.rw.Write(b)
+}
+
+// teeConn is a net.Conn that also copies reads and writes to the provided
+// writers.
+type teeConn struct {
+	net.Conn
+	tlsConn     *tls.Conn
+	ctx         context.Context
+	multiWriter io.Writer
+	teeReader   io.Reader
+}
+
+// newTeeConn creates a teeConn. If the provided context is canceled, writes
+// start passing through to the underlying net.Conn and are no longer copied to
+// in and out.
+func newTeeConn(ctx context.Context, c net.Conn, in, out io.Writer) teeConn {
+	if tc, ok := c.(teeConn); ok {
+		return tc
+	}
+
+	tc := teeConn{Conn: c, ctx: ctx}
+	tc.tlsConn, _ = c.(*tls.Conn)
+	if in != nil {
+		tc.teeReader = io.TeeReader(c, in)
+	}
+	if out != nil {
+		tc.multiWriter = io.MultiWriter(c, out)
+	}
+	return tc
+}
+
+func (tc teeConn) ConnectionState() tls.ConnectionState {
+	if tc.tlsConn == nil {
+		return tls.ConnectionState{}
+	}
+	return tc.tlsConn.ConnectionState()
+}
+
+func (tc teeConn) Write(p []byte) (int, error) {
+	if tc.multiWriter == nil {
+		return tc.Conn.Write(p)
+	}
+	select {
+	case <-tc.ctx.Done():
+		return tc.Conn.Write(p)
+	default:
+	}
+	return tc.multiWriter.Write(p)
+}
+
+func (tc teeConn) Read(p []byte) (int, error) {
+	if tc.teeReader == nil {
+		return tc.Conn.Read(p)
+	}
+	select {
+	case <-tc.ctx.Done():
+		return tc.Conn.Read(p)
+	default:
+	}
+	return tc.teeReader.Read(p)
 }

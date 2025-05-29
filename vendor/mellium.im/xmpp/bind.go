@@ -7,6 +7,7 @@ package xmpp
 import (
 	"context"
 	"encoding/xml"
+	"fmt"
 	"io"
 
 	"mellium.im/xmlstream"
@@ -47,7 +48,7 @@ type bindIQ struct {
 	stanza.IQ
 
 	Bind bindPayload   `xml:"urn:ietf:params:xml:ns:xmpp-bind bind,omitempty"`
-	Err  *stanza.Error `xml:"error,ommitempty"`
+	Err  *stanza.Error `xml:"error,omitempty"`
 }
 
 func (biq *bindIQ) TokenReader() xml.TokenReader {
@@ -72,12 +73,25 @@ type bindPayload struct {
 }
 
 func (bp bindPayload) TokenReader() xml.TokenReader {
-	return xmlstream.Wrap(
-		xmlstream.ReaderFunc(func() (xml.Token, error) {
-			return xml.CharData(bp.JID.String()), io.EOF
-		}),
-		xml.StartElement{Name: xml.Name{Local: "jid"}},
-	)
+	if bp.Resource != "" {
+		return xmlstream.Wrap(
+			xmlstream.ReaderFunc(func() (xml.Token, error) {
+				return xml.CharData(bp.JID.String()), io.EOF
+			}),
+			xml.StartElement{Name: xml.Name{Local: "resource"}},
+		)
+	}
+
+	if bp.JID.String() != "" {
+		return xmlstream.Wrap(
+			xmlstream.ReaderFunc(func() (xml.Token, error) {
+				return xml.CharData(bp.JID.String()), io.EOF
+			}),
+			xml.StartElement{Name: xml.Name{Local: "jid"}},
+		)
+	}
+
+	return nil
 }
 
 func bind(server func(jid.JID, string) (jid.JID, error)) StreamFeature {
@@ -85,46 +99,54 @@ func bind(server func(jid.JID, string) (jid.JID, error)) StreamFeature {
 		Name:       xml.Name{Space: ns.Bind, Local: "bind"},
 		Necessary:  Authn,
 		Prohibited: Ready,
-		List: func(ctx context.Context, e xmlstream.TokenWriter, start xml.StartElement) (req bool, err error) {
-			req = true
-			if err = e.EncodeToken(start); err != nil {
-				return req, err
+		List: func(ctx context.Context, e xmlstream.TokenWriter, start xml.StartElement) (bool, error) {
+			err := e.EncodeToken(start)
+			if err != nil {
+				return true, err
 			}
 			err = e.EncodeToken(start.End())
-			return req, err
+			return true, err
 		},
-		Parse: func(ctx context.Context, r xml.TokenReader, start *xml.StartElement) (bool, interface{}, error) {
+		Parse: func(ctx context.Context, d *xml.Decoder, start *xml.StartElement) (bool, interface{}, error) {
 			parsed := struct {
 				XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-bind bind"`
 			}{}
-			return true, nil, xml.NewTokenDecoder(r).DecodeElement(&parsed, start)
+			return true, nil, d.DecodeElement(&parsed, start)
 		},
-		Negotiate: func(ctx context.Context, session *Session, data interface{}) (mask SessionState, rw io.ReadWriter, err error) {
+		Negotiate: func(ctx context.Context, session *Session, data interface{}) (SessionState, io.ReadWriter, error) {
+			var mask SessionState
 			r := session.TokenReader()
 			defer r.Close()
 			d := xml.NewTokenDecoder(r)
 			w := session.TokenWriter()
 			defer w.Close()
 
+			state := session.State()
 			// Handle the server side of resource binding if we're on the receiving
 			// end of the connection.
-			if (session.State() & Received) == Received {
+			if (state & Received) == Received {
 				tok, err := d.Token()
 				if err != nil {
 					return mask, nil, err
 				}
 				start, ok := tok.(xml.StartElement)
 				if !ok {
-					return mask, nil, stream.BadFormat
+					return mask, nil, fmt.Errorf("xmpp: bind expected IQ start but got %T", tok)
 				}
+
+				iqNamespace := stanza.NSClient
+				if state&S2S == S2S {
+					iqNamespace = stanza.NSServer
+				}
+
 				resReq := bindIQ{}
 				switch start.Name {
-				case xml.Name{Space: ns.Client, Local: "iq"}:
+				case xml.Name{Space: iqNamespace, Local: "iq"}:
 					if err = d.DecodeElement(&resReq, &start); err != nil {
 						return mask, nil, err
 					}
 				default:
-					return mask, nil, stream.BadFormat
+					return mask, nil, fmt.Errorf("xmpp: bind expected IQ start but got %v", start.Name)
 				}
 
 				_, iqid := attr.Get(start.Attr, "id")
@@ -142,10 +164,11 @@ func bind(server func(jid.JID, string) (jid.JID, error)) StreamFeature {
 
 				resp := bindIQ{
 					IQ: stanza.IQ{
-						ID:   iqid,
-						From: resReq.IQ.To,
-						To:   resReq.IQ.From,
-						Type: stanza.ResultIQ,
+						XMLName: xml.Name{Space: iqNamespace, Local: "iq"},
+						ID:      iqid,
+						From:    resReq.IQ.To,
+						To:      resReq.IQ.From,
+						Type:    stanza.ResultIQ,
 					},
 				}
 
@@ -153,7 +176,6 @@ func bind(server func(jid.JID, string) (jid.JID, error)) StreamFeature {
 					// If a stanza error was returned:
 					resp.Err = &stanzaErr
 				} else {
-
 					resp.Bind = bindPayload{JID: j}
 				}
 
@@ -161,21 +183,22 @@ func bind(server func(jid.JID, string) (jid.JID, error)) StreamFeature {
 				if err != nil {
 					return mask, nil, err
 				}
-				return mask, nil, w.Flush()
+				return Ready, nil, w.Flush()
 			}
 
 			// Client encodes an IQ requesting resource binding.
 			reqID := attr.RandomID()
 			req := &bindIQ{
 				IQ: stanza.IQ{
-					ID:   reqID,
-					Type: stanza.SetIQ,
+					XMLName: xml.Name{Space: stanza.NSClient, Local: "iq"},
+					ID:      reqID,
+					Type:    stanza.SetIQ,
 				},
 				Bind: bindPayload{
-					Resource: session.origin.Resourcepart(),
+					Resource: session.LocalAddr().Resourcepart(),
 				},
 			}
-			_, err = req.WriteXML(w)
+			_, err := req.WriteXML(w)
 			if err != nil {
 				return mask, nil, err
 			}
@@ -200,7 +223,7 @@ func bind(server func(jid.JID, string) (jid.JID, error)) StreamFeature {
 			}
 			resp := bindIQ{}
 			switch start.Name {
-			case xml.Name{Space: ns.Client, Local: "iq"}:
+			case xml.Name{Space: stanza.NSClient, Local: "iq"}:
 				if err = d.DecodeElement(&resp, &start); err != nil {
 					return mask, nil, err
 				}
@@ -212,7 +235,7 @@ func bind(server func(jid.JID, string) (jid.JID, error)) StreamFeature {
 			case resp.ID != reqID:
 				return mask, nil, stream.UndefinedCondition
 			case resp.Type == stanza.ResultIQ:
-				session.origin = resp.Bind.JID
+				session.UpdateAddr(resp.Bind.JID)
 			case resp.Type == stanza.ErrorIQ:
 				return mask, nil, resp.Err
 			default:

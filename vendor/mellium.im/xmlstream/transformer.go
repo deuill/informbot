@@ -98,6 +98,13 @@ type TokenWriteFlushCloser interface {
 	Flusher
 }
 
+// TokenWriteFlusher is the interface that groups the basic EncodeToken, and
+// Flush methods.
+type TokenWriteFlusher interface {
+	TokenWriter
+	Flusher
+}
+
 // TokenReadCloser is the interface that groups the basic Token and Close
 // methods.
 type TokenReadCloser interface {
@@ -290,4 +297,86 @@ func (ar *attrRemover) Token() (xml.Token, error) {
 	start.Attr = b
 
 	return start, nil
+}
+
+// InsertFunc calls f after writing any start element to the stream.
+// The function can decide based on the passed in StartElement whether to insert
+// any additional tokens into the stream by writing them to w.
+func InsertFunc(f func(start xml.StartElement, level uint64, w TokenWriter) error) Transformer {
+	if f == nil {
+		f = func(xml.StartElement, uint64, TokenWriter) error { return nil }
+	}
+
+	var depth uint64
+	var pr *PipeReader
+	return func(r xml.TokenReader) xml.TokenReader {
+		return ReaderFunc(func() (xml.Token, error) {
+			if pr != nil {
+				tok, err := pr.Token()
+				if tok != nil || err != io.EOF {
+					return tok, err
+				}
+				pr = nil
+			}
+
+			tok, err := r.Token()
+			if err != nil {
+				return tok, err
+			}
+			switch t := tok.(type) {
+			case xml.StartElement:
+				depth++
+				var pw *PipeWriter
+				pr, pw = Pipe()
+				go func() {
+					pw.CloseWithError(f(t, depth, pw))
+				}()
+			case xml.EndElement:
+				if depth > 0 {
+					depth--
+				}
+			}
+
+			return tok, err
+		})
+	}
+}
+
+// Insert adds one XML stream to another just before the close token, matching
+// on the token name.
+// If either component of the name is empty it is considered a wildcard.
+func Insert(name xml.Name, m Marshaler) Transformer {
+	return func(r xml.TokenReader) xml.TokenReader {
+		var inner xml.TokenReader
+		return ReaderFunc(func() (xml.Token, error) {
+			if inner != nil {
+				tok, err := inner.Token()
+				switch {
+				case tok != nil && err == io.EOF:
+					inner = nil
+					return tok, nil
+				case tok == nil && err == io.EOF:
+					inner = nil
+				default:
+					return tok, err
+				}
+			}
+
+			tok, err := r.Token()
+			if err != nil {
+				return tok, err
+			}
+
+			if end, ok := tok.(xml.EndElement); ok &&
+				((name.Space == "" && name.Local == "") ||
+					end.Name == name ||
+					(end.Name.Space == name.Space && name.Local == "") ||
+					(end.Name.Local == name.Local && name.Space == "")) {
+				inner = MultiReader(m.TokenReader(), Token(end))
+				return inner.Token()
+			}
+
+			return tok, err
+		})
+	}
 }
