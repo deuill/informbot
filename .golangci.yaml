@@ -1,0 +1,33 @@
+version: "2"
+run:
+  tests: false
+linters:
+  enable:
+    - godox
+    - gosec
+    - nilerr
+    - revive
+    - unparam
+  exclusions:
+    generated: lax
+    presets:
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - godox
+        text: Line contains TODO/BUG/FIXME.+
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
